@@ -2,12 +2,37 @@
 //! counterpart) plus the [`App`] methods that spawn decode workers and turn `ImagesEnabled` /
 //! `FiguresEnabled` policy into runtime decisions.
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
 use super::{App, AppEvent};
 use crate::config::ImagesEnabled;
+
+/// A decode slot lives with its worker, not with a cache entry that an edit
+/// or document swap may evict while that worker is still running.
+struct DecodePermit(Arc<AtomicUsize>);
+
+impl DecodePermit {
+    fn acquire(slots: &Arc<AtomicUsize>) -> Option<Self> {
+        slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 4).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(slots.clone()))
+    }
+}
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Idle window after the last edit before a figure (diagram / `$$...$$` math) re-render is
 /// dispatched.  Typing in Rendered mode reparses each keystroke, minting a fresh content-hashed
@@ -57,6 +82,32 @@ pub(super) fn infos_in_viewport_window(
                 None
             }
         })
+        .collect()
+}
+
+fn inline_infos_in_viewport_window(
+    state: &crate::editor::EditorState,
+    scroll: usize,
+    height: usize,
+    margin: usize,
+) -> Vec<crate::document::ImageBlockInfo> {
+    let effective = state.effective_rows(state.viewport_width.max(1));
+    let start = scroll.saturating_sub(margin);
+    let end = scroll.saturating_add(height).saturating_add(margin);
+    state
+        .parsed
+        .inline_math
+        .requests
+        .iter()
+        .filter(|info| {
+            let rows = state
+                .parsed
+                .source_map
+                .rendered_lines_for_block(info.block_idx);
+            effective.rendered_line_visual_row(rows.start) < end
+                && effective.rendered_line_visual_row(rows.end) > start
+        })
+        .cloned()
         .collect()
 }
 
@@ -356,7 +407,9 @@ impl App {
     /// a batch of previously-blocked decodes, where eagerness matches the user's intent.  Safe to
     /// repeat: `ImageCache::request` rejects URLs it already tracks.
     pub(super) fn dispatch_image_decodes(&mut self) {
-        let infos: Vec<crate::document::ImageBlockInfo> = self.editor.parsed.image_blocks.clone();
+        let mut infos: Vec<crate::document::ImageBlockInfo> =
+            self.editor.parsed.image_blocks.clone();
+        infos.extend(self.editor.parsed.inline_math.requests.iter().cloned());
         self.dispatch_image_decodes_for(&infos);
     }
 
@@ -392,6 +445,12 @@ impl App {
             doc_height,
             VIEWPORT_DISPATCH_MARGIN,
         );
+        infos.extend(inline_infos_in_viewport_window(
+            &self.editor,
+            scroll,
+            doc_height,
+            VIEWPORT_DISPATCH_MARGIN,
+        ));
         // A document that gains its first image mid-session — a paste, or a typed `![](…)` —
         // never passed the on-load prompt, so `session_images_enabled` is unset: ask now, unless
         // the user is typing (see `IMAGES_PROMPT_TYPING_PAUSE`) or another modal is open, whose
@@ -405,14 +464,28 @@ impl App {
             && self.media_renderable()
             && self.modal_stack.is_empty()
             && infos.iter().any(|info| info.source.is_none());
-        if wants_prompt {
+        let wants_figures_prompt = matches!(
+            self.config.figures.enabled,
+            crate::config::FiguresEnabled::Ask
+        ) && self.session_diagrams_enabled.is_none()
+            && self.media_renderable()
+            && self.modal_stack.is_empty()
+            && infos.iter().any(|info| info.source.is_some());
+        if wants_prompt || wants_figures_prompt {
             let typing_until = self
                 .last_editor_key_at
                 .map(|t| t + IMAGES_PROMPT_TYPING_PAUSE)
                 .filter(|&due| now < due);
             match typing_until {
                 Some(due) => self.images_prompt_due = Some(due),
-                None => self.queue_images_enabled_prompt(),
+                None => {
+                    if wants_figures_prompt {
+                        self.queue_diagrams_enabled_prompt();
+                    }
+                    if wants_prompt {
+                        self.queue_images_enabled_prompt();
+                    }
+                }
             }
         }
         if holding {
@@ -465,15 +538,7 @@ impl App {
             self.config.images.max_width as u16,
             self.config.images.max_height as u16,
         ));
-        let font_size = self
-            .capabilities
-            .image_picker
-            .as_ref()
-            // ratatui-image 11 returns a `FontSize`; internally we carry a `(width, height)`.
-            .map(|p| {
-                let fs = p.font_size();
-                (fs.width, fs.height)
-            });
+        let font_size = Some(self.editor.image_font_size);
         // Picker + observed area width let the worker build the scratch buffer off the UI thread.
         // Missing either (no image support, or the first iteration before a term size is known)
         // skips it and `get_protocol_pair` falls back to a sync encode on that cold path.
@@ -511,6 +576,8 @@ impl App {
             .unwrap_or([0x1a, 0x1a, 0x1a, 255]);
 
         for info in infos {
+            // A paragraph can contain thousands of formulas. Bound concurrent
+            // decode work; arrivals trigger the next viewport dispatch.
             // Skip a declined class, so "yes images, no diagrams" triggers no mermaid renders.
             let is_diagram = info.source.is_some();
             if is_diagram && !diagrams_on {
@@ -519,6 +586,9 @@ impl App {
             if !is_diagram && !images_on {
                 continue;
             }
+            let Some(permit) = DecodePermit::acquire(&self.image_decode_slots) else {
+                break;
+            };
             if !self.editor.images.request(&info.url) {
                 continue;
             }
@@ -547,6 +617,16 @@ impl App {
                         Some(crate::diagram::DiagramSource::Mermaid(src)) => {
                             crate::diagram::resolve_mermaid(url.clone(), src, max_cells, font_size)
                                 .map_err(|e| (url.clone(), e.to_string()))
+                        }
+                        Some(crate::diagram::DiagramSource::InlineLatex(src)) => {
+                            crate::diagram::math::resolve_inline_latex(
+                                url.clone(),
+                                src,
+                                font_size,
+                                latex_fg,
+                                latex_bg,
+                            )
+                            .map_err(|e| (url.clone(), e.to_string()))
                         }
                         Some(crate::diagram::DiagramSource::Latex(src)) => {
                             crate::diagram::resolve_latex(
@@ -594,7 +674,29 @@ impl App {
                             let rows =
                                 crate::image::aspect_rows_of(&loaded.image, mw, mh, fs) as u16;
                             if width > 0 && rows > 0 {
-                                let rect = Rect::new(0, 0, width, rows);
+                                let rect = if matches!(
+                                    source,
+                                    Some(crate::diagram::DiagramSource::InlineLatex(_))
+                                ) {
+                                    Rect::new(
+                                        0,
+                                        0,
+                                        loaded
+                                            .image
+                                            .width()
+                                            .div_ceil(u32::from(fs.0.max(1)))
+                                            .min(u16::MAX as u32)
+                                            as u16,
+                                        loaded
+                                            .image
+                                            .height()
+                                            .div_ceil(u32::from(fs.1.max(1)))
+                                            .min(u16::MAX as u32)
+                                            as u16,
+                                    )
+                                } else {
+                                    Rect::new(0, 0, width, rows)
+                                };
 
                                 let scratch = {
                                     let _expected = crate::terminal::ExpectedPanic::new();
@@ -683,6 +785,7 @@ impl App {
                     ok = matches!(event, AppEvent::ImageReady(Ok(_))),
                     "decode worker finished",
                 );
+                drop(permit);
                 let _ = tx.send(event);
             });
         }
@@ -693,6 +796,158 @@ impl App {
 mod tests {
     use super::*;
     use crate::document::{ImageBlockInfo, SourceMap};
+
+    #[test]
+    fn inline_formula_dispatches_and_arrival_recomposes_prose() {
+        let mut app = crate::app::test_utils::app_with_buffer("Before $x^2$ after.\n", 0);
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
+        app.editor.inline_math_supported = true;
+        app.editor.refresh_parsed();
+        let info = app.editor.parsed.inline_math.requests[0].clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.app_tx = Some(tx);
+        app.dispatch_visible_image_decodes(0, 40);
+        assert!(
+            app.editor.images.status(&info.url).is_some(),
+            "inline formula must enter the shared decode worker"
+        );
+        let event = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        app.handle_async_event(event);
+        assert!(
+            app.images_dirty,
+            "arrival must schedule normal geometry refresh"
+        );
+        app.editor.refresh_parsed();
+        assert!(!app.editor.parsed.inline_math.formulas.is_empty());
+        assert_eq!(app.editor.buffer.contents(), "Before $x^2$ after.\n");
+        let display = crate::diagram::resolve_latex(
+            "display".into(),
+            "x^2",
+            Some((80, 24)),
+            Some(app.editor.image_font_size),
+            [204, 204, 204, 255],
+            [26, 26, 26, 255],
+        )
+        .unwrap();
+        let Some(crate::image::DecodeStatus::Ready { image: inline, .. }) =
+            app.editor.images.status(&info.url)
+        else {
+            panic!("decoded")
+        };
+        assert!(
+            inline.height() < display.image.height(),
+            "inline math must use body-sized text style, not display padding"
+        );
+    }
+
+    #[test]
+    fn inline_math_asks_for_figures_without_a_display_block() {
+        let mut app = crate::app::test_utils::app_with_buffer("Before $x^2$ after.\n", 0);
+        app.editor.inline_math_supported = true;
+        app.editor.refresh_parsed();
+        assert!(
+            crate::app::modal::FiguresEnabledPromptModal::from_state(&app.editor, &app.config)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn inline_math_worker_limit_survives_cache_gc() {
+        use std::sync::atomic::Ordering;
+        let mut app = crate::app::test_utils::app_with_buffer("Before $x^2$ after.", 0);
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
+        app.editor.inline_math_supported = true;
+        app.editor.refresh_parsed();
+        let info = app.editor.parsed.inline_math.requests[0].clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut releases: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let slots = app.image_decode_slots.clone();
+            let barrier = barrier.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            releases.push(tx);
+            workers.push(std::thread::spawn(move || {
+                slots.fetch_add(1, Ordering::AcqRel);
+                barrier.wait();
+                let _ = rx.recv();
+                slots.fetch_sub(1, Ordering::AcqRel);
+            }));
+        }
+        barrier.wait();
+        app.editor.images.gc(&std::collections::HashSet::new());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.app_tx = Some(tx);
+        app.dispatch_image_decodes_for(std::slice::from_ref(&info));
+        let dispatched = app.editor.images.status(&info.url).is_some();
+        drop(releases);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            !dispatched,
+            "GC cannot free slots still owned by running workers"
+        );
+    }
+
+    #[test]
+    fn inline_math_cold_dispatch_uses_visual_rows_after_a_jump() {
+        let source = format!("{}\n\nCold $x^2$ formula.\n", "word ".repeat(1000));
+        let mut app = crate::app::test_utils::app_with_buffer(&source, 0);
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
+        app.editor.inline_math_supported = true;
+        app.editor.set_viewport_width(10);
+        let info = app.editor.parsed.inline_math.requests[0].clone();
+        let logical = app
+            .editor
+            .parsed
+            .source_map
+            .rendered_lines_for_block(info.block_idx)
+            .start;
+        let scroll = app.editor.parsed.visual_rows_before(logical, 10);
+        assert!(scroll > 100);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.app_tx = Some(tx);
+        app.dispatch_visible_image_decodes(scroll, 20);
+        assert!(
+            app.editor.images.status(&info.url).is_some(),
+            "a visible cold formula must dispatch after a direct jump"
+        );
+    }
+
+    #[test]
+    fn inline_math_uses_document_geometry() {
+        let source = "# Head\n\nBefore $x^2$ middle $y_1$ after.\n";
+        let mut app = crate::app::test_utils::app_with_buffer(source, 0);
+        app.capabilities.image_protocol = Some(crate::terminal::ImageProtocol::KittyDirect);
+        let dims = app.compute_doc_dims(ratatui::layout::Size::new(120, 24));
+        app.prepare_viewport(&dims);
+        for info in app.editor.parsed.inline_math.requests.clone() {
+            let Some(crate::diagram::DiagramSource::InlineLatex(src)) = info.source else {
+                panic!()
+            };
+            let loaded = crate::diagram::math::resolve_inline_latex(
+                info.url.clone(),
+                &src,
+                Some(app.editor.image_font_size),
+                [204, 204, 204, 255],
+                [26, 26, 26, 255],
+            )
+            .unwrap();
+            app.editor.images.set_decoded(&info.url, loaded.image);
+        }
+        app.editor.refresh_parsed();
+        for width in [120, 90, 140] {
+            let dims = app.compute_doc_dims(ratatui::layout::Size::new(width, 24));
+            app.prepare_viewport(&dims);
+            let snapshots = crate::ui::image_view::build_snapshots(&app.editor, dims.doc_area, 0);
+            assert_eq!(snapshots.len(), 2);
+            assert!(snapshots
+                .iter()
+                .all(|s| s.rect.x >= dims.doc_area.x && s.rect.right() <= dims.doc_area.right()));
+            assert_eq!(app.editor.buffer.contents(), source);
+        }
+    }
 
     /// A `(image_blocks, source_map)` pair where each image produces one rendered line at a known
     /// position, block indices incrementing in order.
@@ -738,6 +993,7 @@ mod tests {
                 scratch: None,
                 sliced: None,
                 direct: None,
+                formula: None,
             },
         )));
         assert!(
@@ -765,11 +1021,12 @@ mod tests {
                 scratch: None,
                 sliced: None,
                 direct: None,
+                formula: None,
             },
         )));
         assert!(matches!(
             app.editor.images.status("img.png"),
-            Some(crate::image::DecodeStatus::Ready(_))
+            Some(crate::image::DecodeStatus::Ready { .. })
         ));
         // A's stale failure must be dropped: `request` never retries a `Failed` entry, so
         // overwriting the Ready decode would pin the image as broken.
@@ -780,7 +1037,7 @@ mod tests {
         assert!(
             matches!(
                 app.editor.images.status("img.png"),
-                Some(crate::image::DecodeStatus::Ready(_))
+                Some(crate::image::DecodeStatus::Ready { .. })
             ),
             "a stale failure must not overwrite a fresh decode"
         );

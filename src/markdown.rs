@@ -24,3 +24,5 @@ pub use parser::{
 pub use render_cache::RenderCache;
 pub use renderer::{ImageRowOverride, Renderer};
 pub use row_origin::{ColOrigin, ContentKind, RowOrigin, RowSink};
+pub(crate) mod currency_math;
+pub(crate) mod paren_math;

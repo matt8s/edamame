@@ -18,6 +18,7 @@ use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{Resize, StatefulImage};
 
 use super::kitty_direct::{self, Geometry};
+use super::loader::FormulaMetrics;
 
 /// Encode `image` as halfblocks at `rect`, returning the rendered cells.
 ///
@@ -176,12 +177,22 @@ pub fn aspect_rows_of(
 }
 
 /// Status of a decode attempt for a URL.
+#[derive(Debug)]
 pub enum DecodeStatus {
     /// Decode in flight; `paint_images` shows the `[Image: alt]` placeholder meanwhile.
     Pending,
     /// Decode succeeded.  The pixels are kept in an `Arc` so a protocol can be rebuilt at a new
     /// size without re-running the slow PNG/JPEG decode or duplicating the bytes.
-    Ready(Arc<DynamicImage>),
+    ///
+    /// `formula` carries the exact TeX baseline metric for inline math, stored atomically with
+    /// the raster: it is inserted, evicted, and GC'd in the same calls as the pixels, so a stale
+    /// async result can neither attach metrics to a newer raster nor strip them from one.  `None`
+    /// for everything else (display math, mermaid, photos) and for legacy synthetic `Ready`
+    /// entries, whose consumers keep the documented centred fallback.
+    Ready {
+        image: Arc<DynamicImage>,
+        formula: Option<FormulaMetrics>,
+    },
     /// Decode failed (IO, remote-blocked, corrupt bytes).  Never retried automatically.  The
     /// message is captured for future surfacing but has no consumer yet.
     Failed(#[allow(dead_code)] String),
@@ -394,11 +405,15 @@ impl ImageCache {
     /// [`Self::set_decoded_with_prebuilt`] so the halfblocks scratch is captured too.
     #[allow(dead_code)]
     pub fn set_decoded(&mut self, url: &str, image: DynamicImage) {
-        self.set_decoded_with_prebuilt(url, image, None, None, None);
+        self.set_decoded_with_prebuilt(url, image, None, None, None, None);
     }
 
     /// [`Self::set_decoded`] plus a halfblocks scratch the decode worker already rendered; the
     /// next `get_protocol_pair` at the same dims claims it instead of encoding on the UI thread.
+    ///
+    /// `formula` is the TeX baseline metric for inline math rasters (`None` for every other
+    /// decode): it is stored in the `Ready` entry itself, so it rides with the raster through
+    /// eviction and GC.
     pub fn set_decoded_with_prebuilt(
         &mut self,
         url: &str,
@@ -406,9 +421,15 @@ impl ImageCache {
         prebuilt_scratch: Option<(Rect, Buffer)>,
         prebuilt_sliced: Option<(Rect, SlicedProtocol)>,
         prebuilt_direct: Option<(Rect, DirectPlacement)>,
+        formula: Option<FormulaMetrics>,
     ) {
-        self.decoded
-            .insert(url.to_owned(), DecodeStatus::Ready(Arc::new(image)));
+        self.decoded.insert(
+            url.to_owned(),
+            DecodeStatus::Ready {
+                image: Arc::new(image),
+                formula,
+            },
+        );
         self.protocols.retain(|(u, _, _), _| u != url);
         self.prebuilt_scratches.retain(|(u, _, _), _| u != url);
         self.prebuilt_sliced.retain(|(u, _, _), _| u != url);
@@ -467,13 +488,13 @@ impl ImageCache {
     ) -> Option<&mut ProtocolPair> {
         let native_picker = native_picker?;
         let resize_tx = self.resize_tx.as_ref()?.clone();
-        if !matches!(self.decoded.get(url), Some(DecodeStatus::Ready(_))) {
+        if !matches!(self.decoded.get(url), Some(DecodeStatus::Ready { .. })) {
             return None;
         }
         let key = (url.to_owned(), width, height);
         if !self.protocols.contains_key(&key) {
             let image_arc = match self.decoded.get(url) {
-                Some(DecodeStatus::Ready(img)) => Arc::clone(img),
+                Some(DecodeStatus::Ready { image: img, .. }) => Arc::clone(img),
                 _ => return None,
             };
             let full_rect = Rect::new(0, 0, width, height);
@@ -668,7 +689,7 @@ impl ImageCache {
         max_height_cells: u16,
         font_size: (u16, u16),
     ) -> Option<usize> {
-        let Some(DecodeStatus::Ready(img)) = self.decoded.get(url) else {
+        let Some(DecodeStatus::Ready { image: img, .. }) = self.decoded.get(url) else {
             return None;
         };
         Some(aspect_rows_of(
@@ -690,7 +711,7 @@ impl ImageCache {
         font_size: (u16, u16),
     ) -> Option<usize> {
         match self.decoded.get(url) {
-            Some(DecodeStatus::Ready(img)) => Some(aspect_rows_of(
+            Some(DecodeStatus::Ready { image: img, .. }) => Some(aspect_rows_of(
                 img,
                 max_width_cells,
                 max_height_cells,
@@ -857,7 +878,7 @@ mod tests {
         assert!(cache.status("http://example.com/b.png").is_none());
         assert!(matches!(
             cache.status("local/c.png"),
-            Some(DecodeStatus::Ready(_))
+            Some(DecodeStatus::Ready { .. })
         ));
         assert!(cache.request("https://example.com/a.png"));
     }
@@ -878,7 +899,7 @@ mod tests {
         cache.set_decoded("a.png", img);
         assert!(matches!(
             cache.status("a.png"),
-            Some(DecodeStatus::Ready(_))
+            Some(DecodeStatus::Ready { .. })
         ));
         assert!(!cache.request("a.png"));
     }
@@ -931,6 +952,7 @@ mod tests {
             Some((rect, prebuilt)),
             None,
             None,
+            None,
         );
         assert_eq!(cache.prebuilt_scratch_count(), 1);
 
@@ -957,6 +979,7 @@ mod tests {
             Some((prebuilt_rect, prebuilt)),
             None,
             None,
+            None,
         );
 
         let picker = halfblocks_picker();
@@ -979,6 +1002,7 @@ mod tests {
             Some((rect, Buffer::empty(rect))),
             None,
             None,
+            None,
         );
         assert_eq!(cache.prebuilt_scratch_count(), 1);
         cache.invalidate_protocols();
@@ -998,7 +1022,7 @@ mod tests {
         assert_eq!(cache.protocol_count(), 0);
         assert!(matches!(
             cache.status("a.png"),
-            Some(DecodeStatus::Ready(_))
+            Some(DecodeStatus::Ready { .. })
         ));
     }
 
@@ -1099,6 +1123,7 @@ mod tests {
             None,
             Some((rect, sliced)),
             None,
+            None,
         );
         assert_eq!(cache.prebuilt_sliced_count(), 1);
 
@@ -1128,6 +1153,7 @@ mod tests {
             DynamicImage::new_rgba8(8, 4),
             None,
             Some((rect, sliced)),
+            None,
             None,
         );
 
@@ -1184,6 +1210,7 @@ mod tests {
             None,
             None,
             Some((rect, direct)),
+            None,
         );
         assert_eq!(cache.prebuilt_direct_count(), 1);
 

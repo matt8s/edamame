@@ -262,6 +262,7 @@ where
     /// First line of the top-level block being parsed; every line handed out is relative to it.
     base_line: usize,
     leaf: Option<LeafRec>,
+    inline_math: Vec<(Range<usize>, String)>,
 }
 
 impl<'s, I> EventStream<'s, I>
@@ -278,6 +279,7 @@ where
             spare_cols: Vec::new(),
             base_line: 0,
             leaf: None,
+            inline_math: Vec::new(),
         }
     }
 
@@ -291,6 +293,13 @@ where
     fn pull(&mut self) -> Option<Event<'s>> {
         let (event, range) = self.inner.next()?;
         self.ranges.observe(self.lines.src, &event, &range);
+        // A global atom budget bounds source retention, decodes and cache size,
+        // even when thousands of formulas share one visible paragraph.
+        if let Event::InlineMath(source) = &event {
+            if self.inline_math.len() < 128 && source.len() <= 64 * 1024 {
+                self.inline_math.push((range.clone(), source.to_string()));
+            }
+        }
         self.pulled_range = range;
         Some(event)
     }
@@ -335,9 +344,16 @@ where
 
     /// Drain the events the parser left unread, so the tracker sees every one, and hand back
     /// the top-level blocks' byte ranges and every source line's starting byte.
-    pub(super) fn into_parts(mut self) -> (Vec<Range<usize>>, Vec<usize>) {
+    #[allow(clippy::type_complexity)]
+    pub(super) fn into_parts(
+        mut self,
+    ) -> (Vec<Range<usize>>, Vec<usize>, Vec<(Range<usize>, String)>) {
         while self.next().is_some() {}
-        (self.ranges.into_ranges(), self.lines.starts)
+        (
+            self.ranges.into_ranges(),
+            self.lines.starts,
+            self.inline_math,
+        )
     }
 
     /// Range of the event [`next`](Self::next) just returned.  Ask before peeking again: a peek

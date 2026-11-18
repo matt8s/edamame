@@ -354,13 +354,14 @@ pub enum Inline {
     FootnoteReference {
         label: String,
     },
-    /// `$...$` inline or `$$...$$` display math, raw LaTeX source.
-    /// Rendered as source-equivalent text in phase 1 (inline beautification
-    /// is phase 2); a paragraph holding exactly one `display: true` Math is
-    /// promoted to a `Block::ImageBlock` by the post-pass.
+    /// Dollar or parenthesis inline math, or dollar display math, with raw
+    /// LaTeX body and separate literal delimiters. A display-only paragraph is
+    /// promoted to an image block; inline composition retains this source fallback.
     Math {
         source: String,
         display: bool,
+        /// Inline `\(...\)` rather than dollar delimiters.
+        parenthesized: bool,
     },
     SoftBreak,
     HardBreak,
@@ -427,11 +428,15 @@ fn push_plain(inlines: &[Inline], for_slug: bool, out: &mut String, soft_breaks:
             Inline::FootnoteReference { .. } => {}
             // Math renders as its source in phase 1 (delimiters included,
             // width-equivalent to the source text).
-            Inline::Math { source, display } => {
-                let delim = if *display { "$$" } else { "$" };
-                out.push_str(delim);
+            Inline::Math {
+                source,
+                display,
+                parenthesized,
+            } => {
+                let (open, close) = math_delimiters(*display, *parenthesized);
+                out.push_str(open);
                 out.push_str(source);
-                out.push_str(delim);
+                out.push_str(close);
             }
             Inline::SoftBreak if for_slug => out.push('\n'),
             Inline::SoftBreak => {
@@ -440,6 +445,17 @@ fn push_plain(inlines: &[Inline], for_slug: bool, out: &mut String, soft_breaks:
             }
             Inline::HardBreak => out.push('\n'),
         }
+    }
+}
+
+/// Literal delimiters retained by the AST independently of the TeX body.
+pub fn math_delimiters(display: bool, parenthesized: bool) -> (&'static str, &'static str) {
+    if parenthesized {
+        (r"\(", r"\)")
+    } else if display {
+        ("$$", "$$")
+    } else {
+        ("$", "$")
     }
 }
 

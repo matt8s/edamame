@@ -1058,9 +1058,13 @@ impl<'t> Renderer<'t> {
             }
             // Math renders as its delimited source — width equals the raw
             // text width, so table borders and cursor columns stay aligned.
-            Inline::Math { source, display } => {
-                let delim = if *display { "$$" } else { "$" };
-                str_cells(delim) + str_cells(source) + str_cells(delim)
+            Inline::Math {
+                source,
+                display,
+                parenthesized,
+            } => {
+                let (open, close) = super::ast::math_delimiters(*display, *parenthesized);
+                str_cells(open) + str_cells(source) + str_cells(close)
             }
             Inline::SoftBreak | Inline::HardBreak => 1,
         }
@@ -1195,10 +1199,14 @@ impl<'t> Renderer<'t> {
             // `Block::ImageBlock` by the post-pass before it ever reaches
             // this arm, so the display form here is the mixed-paragraph
             // fallback only.
-            Inline::Math { source, display } => {
-                let delim = if *display { "$$" } else { "$" };
+            Inline::Math {
+                source,
+                display,
+                parenthesized,
+            } => {
+                let (open, close) = super::ast::math_delimiters(*display, *parenthesized);
                 vec![Span::styled(
-                    format!("{delim}{source}{delim}"),
+                    format!("{open}{source}{close}"),
                     base.patch(self.theme.code_span),
                 )]
             }
@@ -1774,6 +1782,7 @@ mod tests {
             vec![Inline::Math {
                 source: String::new(),
                 display: false,
+                parenthesized: false,
             }],
         ];
         for inlines in cases {
@@ -1797,6 +1806,7 @@ mod tests {
             inlines: vec![Inline::Math {
                 source: "\nx\ny\n".into(),
                 display: true,
+                parenthesized: false,
             }],
             src: SrcLines::new(0, &[Some(2), Some(1), None, None]),
         };

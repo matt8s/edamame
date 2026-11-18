@@ -75,8 +75,8 @@ pub struct HtmlExportOptions {
     pub title: Option<String>,
     /// Render *figures* — fenced ```mermaid code blocks and `$$...$$` display math — to SVG
     /// embedded in a `<figure>` (`mermaid-diagram` / `math-formula`), each falling back to its
-    /// source form on failure so the source is never lost.  Independent of this flag, inline `$…$`
-    /// is always emitted as literal source, matching the terminal preview.
+    /// source form on failure so the source is never lost. Independent of this flag, inline
+    /// `$…$` and `\(…\)` are always emitted as literal source with their original delimiters.
     pub render_figures: bool,
 }
 
@@ -115,11 +115,20 @@ pub(super) struct Rendered {
 pub(super) fn render(markdown: &str, opts: &HtmlExportOptions) -> Result<Rendered> {
     // Collected so the rewrite passes can mutate events in place.
     let mut events: Vec<Event> = DocParser::with_options(markdown, parser_options())
-        .into_events()
+        .into_offset_iter()
+        .map(|(event, range)| match event {
+            // The shared parser makes the TeX body opaque. Keep its original delimiters
+            // before dropping offsets: `replace_math` reconstructs dollar math only.
+            // Text is escaped by pulldown and still passes through `sanitize_body`.
+            Event::InlineMath(_) if markdown[range.clone()].starts_with(r"\(") => {
+                Event::Text(markdown[range].into())
+            }
+            other => other,
+        })
         .collect();
 
-    // Before `replace_math`, which turns heading math into plain text: the slug reads the
-    // `InlineMath` events the in-app parser sees.
+    // Before `replace_math`, which turns dollar heading math into plain text: the slug reads
+    // the same literal math delimiters the in-app parser retains.
     assign_heading_ids(&mut events);
 
     let mut figures = Figures::new();
@@ -1652,6 +1661,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parenthesis_math_heading_ids_match_the_in_app_anchor_table() {
+        let md = "# Math \\(x\\)\n\n# Math \\(x\\)\n\n## TeX \\(\\text{[a](b) *c*}\\)\n";
+        let theme = crate::config::Theme::default();
+        let parsed = crate::document::ParsedDoc::build(md, &theme, false, 4);
+        assert_eq!(parsed.heading_anchors.len(), 3);
+        for render_figures in [true, false] {
+            let html = render_html(
+                md,
+                &HtmlExportOptions {
+                    render_figures,
+                    ..opts_inline_css()
+                },
+            )
+            .unwrap();
+            for slug in parsed.heading_anchors.keys() {
+                assert!(
+                    html.contains(&format!("id=\"{slug}\"")),
+                    "{slug} missing:\n{html}"
+                );
+            }
+            assert!(html.contains(r">Math \(x\)</h1>"), "{html}");
+            assert!(html.contains(r">TeX \(\text{[a](b) *c*}\)</h2>"), "{html}");
+        }
+    }
+
+    #[test]
+    fn parenthesis_math_exports_as_opaque_original_source() {
+        for (formula, escaped) in [
+            (r"\(x\)", r"\(x\)"),
+            (r"\(\text{[a](b) *c*}\)", r"\(\text{[a](b) *c*}\)"),
+            (
+                r"\(\text{<kbd>K</kbd> <script>inside()</script> &amp; &}\)",
+                r"\(\text{&lt;kbd&gt;K&lt;/kbd&gt; &lt;script&gt;inside()&lt;/script&gt; &amp;amp; &amp;}\)",
+            ),
+        ] {
+            let md = format!(
+                "---\ntitle: hidden\n---\n\nBefore {formula} after.\n\n\
+                 *outside* [safe][ref] [blocked](javascript:outside()) <script>outside()</script>\n\n\
+                 $z$ and $$y$$.\n\n$$x^2$$\n\n[ref]: /target\n"
+            );
+            for render_figures in [true, false] {
+                let opts = HtmlExportOptions {
+                    render_figures,
+                    ..opts_inline_css()
+                };
+                let html = render_html(&md, &opts).unwrap();
+                assert!(
+                    html.contains(&format!("<p>Before {escaped} after.</p>")),
+                    "original formula must be opaque (figures={render_figures}):\n{html}"
+                );
+                assert!(html.contains("<em>outside</em>"), "{html}");
+                assert!(html.contains("href=\"/target\""), "{html}");
+                assert!(!html.contains("href=\"b\""), "{html}");
+                assert!(!html.contains("javascript:"), "{html}");
+                assert!(!html.contains("<script>"), "{html}");
+                assert!(!html.contains("outside()"), "{html}");
+                assert!(!html.contains("title: hidden"), "{html}");
+                assert!(html.contains("<p>$z$ and $$y$$.</p>"), "{html}");
+                assert!(!html.contains("class=\"math math-"), "{html}");
+                if render_figures {
+                    assert!(html.contains("<figure class=\"math-formula\">"), "{html}");
+                } else {
+                    assert!(
+                        html.contains("<pre><code class=\"language-math\">x^2</code></pre>"),
+                        "{html}"
+                    );
+                }
+            }
+        }
+    }
+
     // ── Vuln 4: image inlining stays within the source tree ────────────
 
     fn write_one_px_png(path: &Path) {
@@ -1728,6 +1809,21 @@ mod tests {
         let html = render_html(md, &inline_opts(&source, vec![secret])).unwrap();
         assert_eq!(html.matches("data:image/png").count(), 1, "{html}");
         assert!(html.contains("src=\"../other.png\""), "{html}");
+    }
+
+    #[test]
+    fn parenthesis_math_images_are_not_export_references() {
+        let (_root, secret, source) = root_with_docs();
+        let formula = r#"\(\text{![fake](../secret.png) <img src="../secret.png">}\)"#;
+        assert!(outside_images(formula, &source).is_empty());
+        let md = format!("{formula}\n\n![real][ref]\n\n[ref]: ../secret.png\n");
+        assert_eq!(outside_images(&md, &source), vec![secret.clone()]);
+        let html = render_html(&md, &inline_opts(&source, vec![secret])).unwrap();
+        assert_eq!(html.matches("data:image/png").count(), 1, "{html}");
+        assert!(
+            html.contains(r#"\(\text{![fake](../secret.png) &lt;img src="../secret.png"&gt;}\)"#),
+            "{html}"
+        );
     }
 
     #[test]

@@ -369,6 +369,13 @@ impl App {
         self.last_area_width = dims.doc_area.width;
         self.last_doc_height = dims.doc_height;
         self.last_doc_width = dims.doc_width;
+        let inline_supported = self.capabilities.full_color()
+            && self.capabilities.image_protocol
+                == Some(crate::terminal::ImageProtocol::KittyDirect);
+        if self.editor.inline_math_supported != inline_supported {
+            self.editor.inline_math_supported = inline_supported;
+            self.editor.refresh_parsed();
+        }
         self.editor.set_viewport_width(dims.doc_width);
         // `parsed` is one mode-independent spine, so a mode switch that changes whether paragraphs
         // reflow has to rebuild it.  A no-op when the reflow state already agrees with the mode.
@@ -592,7 +599,15 @@ impl App {
                         target: "image", url = %loaded.url,
                         "decode result discarded — settings changed mid-flight",
                     );
-                    self.editor.images.forget(&loaded.url);
+                    // A duplicate/stale success may arrive after a newer decode
+                    // or a memoized failure. Only retire the request this result
+                    // could still own; never evict a completed entry here.
+                    if matches!(
+                        self.editor.images.status(&loaded.url),
+                        Some(crate::image::DecodeStatus::Pending)
+                    ) {
+                        self.editor.images.forget(&loaded.url);
+                    }
                     return;
                 }
                 self.editor.images.set_decoded_with_prebuilt(
@@ -601,6 +616,7 @@ impl App {
                     loaded.scratch,
                     loaded.sliced,
                     loaded.direct,
+                    loaded.formula,
                 );
                 self.images_dirty = true;
                 self.needs_draw = true;
@@ -1495,6 +1511,110 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn stale_success_preserves_newer_ready_image_and_memoized_failure() {
+        let mut app = app_with_buffer("![alt](image.png)\n", 0);
+        app.config.images.enabled = crate::config::ImagesEnabled::Always;
+        let loaded = || crate::image::LoadedImage {
+            url: "image.png".into(),
+            image: image::DynamicImage::new_rgba8(2, 3),
+            scratch: None,
+            sliced: None,
+            direct: None,
+            formula: None,
+        };
+        app.editor
+            .images
+            .set_decoded("image.png", image::DynamicImage::new_rgba8(7, 9));
+        app.handle_async_event(crate::app::AppEvent::ImageReady(Ok(loaded())));
+        assert!(
+            matches!(app.editor.images.status("image.png"), Some(crate::image::DecodeStatus::Ready { image, .. }) if image.width() == 7 && image.height() == 9),
+            "a duplicate success must neither evict nor overwrite a newer Ready raster"
+        );
+        app.editor
+            .images
+            .set_failed("image.png", "memoized failure".into());
+        app.handle_async_event(crate::app::AppEvent::ImageReady(Ok(loaded())));
+        assert!(
+            matches!(
+                app.editor.images.status("image.png"),
+                Some(crate::image::DecodeStatus::Failed(_))
+            ),
+            "a stale success must not remove failure memoization or permit a retry storm"
+        );
+    }
+
+    /// An inline formula decode completed through the async event must keep
+    /// its baseline metric in the cache's `Ready` entry — the metric travels
+    /// atomically with the raster — and a stale duplicate success must
+    /// neither attach a second metric nor strip the first.
+    #[test]
+    fn inline_formula_ready_keeps_its_baseline_metric_through_the_async_path() {
+        let mut app = app_with_buffer("Before $\\dfrac{a+b}{c+d}$ after.\n", 0);
+        app.config.images.enabled = crate::config::ImagesEnabled::Always;
+        // The default figures policy is `Ask`, whose unanswered prompt
+        // disables the diagram class; answer it for this test.
+        app.config.figures.enabled = crate::config::FiguresEnabled::Always;
+        app.editor.inline_math_supported = true;
+        app.editor.image_font_size = (14, 32);
+        app.editor.refresh_parsed();
+        let info = app
+            .editor
+            .parsed
+            .inline_math
+            .requests
+            .iter()
+            .find(|i| i.source.is_some())
+            .cloned()
+            .expect("an inline formula must be requested");
+        let crate::diagram::DiagramSource::InlineLatex(src) = info.source.unwrap() else {
+            panic!("an inline request carries its source");
+        };
+        let render = |url: String| {
+            crate::diagram::math::resolve_inline_latex(
+                url,
+                &src,
+                Some((14, 32)),
+                [204, 204, 204, 255],
+                [26, 26, 26, 255],
+            )
+            .expect("the inline formula renders")
+        };
+        let loaded = render(info.url.clone());
+        let expected = loaded
+            .formula
+            .expect("an inline raster carries its baseline metric");
+        assert!(
+            app.editor.images.request(&info.url),
+            "the decode must be dispatched"
+        );
+        app.handle_async_event(crate::app::AppEvent::ImageReady(Ok(loaded)));
+        let got = match app.editor.images.status(&info.url) {
+            Some(crate::image::DecodeStatus::Ready { formula, .. }) => *formula,
+            other => panic!("the decode must land Ready with its metric, got {other:?}"),
+        };
+        assert_eq!(
+            got,
+            Some(expected),
+            "the metric must ride with the raster into the cache"
+        );
+
+        // A stale duplicate success (the entry is no longer `Pending`) is
+        // discarded: the Ready entry — raster and metric — stays intact.
+        app.handle_async_event(crate::app::AppEvent::ImageReady(Ok(render(
+            info.url.clone(),
+        ))));
+        let still = match app.editor.images.status(&info.url) {
+            Some(crate::image::DecodeStatus::Ready { formula, .. }) => *formula,
+            other => panic!("a stale duplicate must not evict the Ready entry: {other:?}"),
+        };
+        assert_eq!(
+            still,
+            Some(expected),
+            "the stored metric must survive the stale duplicate"
+        );
     }
 
     #[test]

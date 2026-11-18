@@ -1,8 +1,9 @@
 //! Per-frame layout snapshots for clickable-link hit testing, analogous to `ui::table_view`
 //! and `ui::image_view`.
 //!
-//! Snapshots are AST-backed: every link-styled run ([`LinkRun`]) is collected in document order
-//! and paired, by index, with the UNDERLINED span runs on the block's rendered lines.  An
+//! Recomposed inline-math paragraphs carry source-backed link ranges, clipped to each painted
+//! row. Other blocks are AST-backed: every link-styled run ([`LinkRun`]) is collected in document
+//! order and paired, by index, with UNDERLINED span runs on the block's rendered lines. An
 //! inline image's placeholder is underlined too, so it gets a `LinkRun` of its own that
 //! consumes a run without emitting a snapshot; otherwise every link after an inline image pairs
 //! with the wrong URL.  For a raw-revealed cursor block, callers fall back to
@@ -131,6 +132,57 @@ fn extract_block_links(
     base_dir: Option<&Path>,
     out: &mut Vec<LinkLayoutSnapshot>,
 ) {
+    // Composed physical rows carry source-backed identities. Never re-pair their
+    // paint runs with AST ordinals: one source link can span multiple bands.
+    if state
+        .parsed
+        .inline_math
+        .links
+        .contains_key(&rendered_range.start)
+    {
+        for idx in rendered_range.clone() {
+            let y = state.parsed.visual_rows_before(idx, area.width as usize) as isize
+                - scroll as isize;
+            let Some(links) = state.parsed.inline_math.links.get(&idx) else {
+                continue;
+            };
+            let painted = crate::document::wrap::PaintedRows::new(
+                &state.parsed.lines[idx],
+                state.parsed.row_indent(idx),
+                area.width as usize,
+            );
+            for (sub_row, &(start, end, _)) in painted.rows.iter().enumerate() {
+                let screen_y = y + sub_row as isize;
+                if screen_y < 0 || screen_y >= area.height as isize {
+                    continue;
+                }
+                for link in links {
+                    let from = start.max(link.cols.start);
+                    let to = end.min(link.cols.end);
+                    if from >= to {
+                        continue;
+                    }
+                    let x = painted.cell_of(sub_row, from);
+                    let width = painted.cell_of(sub_row, to) - x;
+                    if width == 0 {
+                        continue;
+                    }
+                    out.push(LinkLayoutSnapshot {
+                        rect: Rect::new(
+                            area.x + x as u16,
+                            area.y + screen_y as u16,
+                            width as u16,
+                            1,
+                        ),
+                        target: LinkTarget::parse(&link.url, base_dir),
+                        url: link.url.clone(),
+                        title: link.title.clone(),
+                    });
+                }
+            }
+        }
+        return;
+    }
     // Collecting runs first skips the per-line geometry walk for the (common) link-free block.
     let mut link_runs: Vec<LinkRun> = Vec::new();
     collect_link_runs_from_block(block, state.parsed.reflow_paragraphs, &mut link_runs);

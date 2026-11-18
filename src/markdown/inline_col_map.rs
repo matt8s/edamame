@@ -121,7 +121,21 @@ impl InlineColMap {
         // [`TextRun`].  Every other event ends the run.
         let mut text: Option<TextRun<'_>> = None;
         let mut one_paragraph = OneParagraph::default();
-        for (event, range) in parser.into_offset_iter() {
+        let events = super::paren_math::adapt(raw_line, parser.into_offset_iter(), |shadow| {
+            Parser::new_with_broken_link_callback(
+                shadow,
+                parse_options(),
+                Some(|link: BrokenLink<'_>| {
+                    labels
+                        .filter(|l| l.has_link(&link.reference))
+                        .map(|_| (CowStr::Borrowed(""), CowStr::Borrowed("")))
+                }),
+            )
+            .into_offset_iter()
+            .map(|(e, r)| (e.into_static(), r))
+            .collect()
+        });
+        for (event, range) in events {
             one_paragraph.see(&event);
             if !matches!(event, Event::Text(_)) {
                 if let Some(run) = text.take() {
@@ -146,8 +160,14 @@ impl InlineColMap {
                 Event::Code(s) => walk.push_code(raw_line, &s, range),
                 // Math renders as its delimited source.  Parsed as math, not text, so it splits
                 // the text around it as the parser does: `y== $a$ ==x` holds no highlight.
-                Event::InlineMath(s) => walk.push_math(&s, "$", range),
-                Event::DisplayMath(s) => walk.push_math(&s, "$$", range),
+                Event::InlineMath(s) => {
+                    let paren = raw_line
+                        .get(range.clone())
+                        .is_some_and(|s| s.starts_with(r"\("));
+                    let (open, close) = super::ast::math_delimiters(false, paren);
+                    walk.push_math(&s, open, close, range);
+                }
+                Event::DisplayMath(s) => walk.push_math(&s, "$$", "$$", range),
                 Event::SoftBreak => walk.push_break(range.start, true),
                 Event::HardBreak => walk.push_break(range.start, false),
                 // The renderer shows inline HTML as its text, except a lone comment.
@@ -513,10 +533,10 @@ impl CharMapWalk {
 
     /// A math span read from `range`, rendered as `delim`, its `source`, then `delim` again: the
     /// delimiters onto the raw ones at the range's ends, the source onto the raw chars between.
-    fn push_math(&mut self, source: &str, delim: &str, range: std::ops::Range<usize>) {
-        self.push_chars(delim, range.start);
-        self.push_chars(source, range.start + delim.len());
-        self.push_chars(delim, range.end.saturating_sub(delim.len()));
+    fn push_math(&mut self, source: &str, open: &str, close: &str, range: std::ops::Range<usize>) {
+        self.push_chars(open, range.start);
+        self.push_chars(source, range.start + open.len());
+        self.push_chars(close, range.end.saturating_sub(close.len()));
     }
 
     /// A break, rendered as a space unless [`InlineColMap::from_walk`] drops a `soft` one.
@@ -658,6 +678,14 @@ fn footnote_collapse_char_indices(raw_line: &str, labels: Option<&RefLabels>) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paren_math_literal_map_preserves_every_source_column() {
+        let source = r"前 \(x_1+\alpha\) 後 $y$.";
+        let map = super::InlineColMap::build(source);
+        let expected: Vec<_> = (0..=source.chars().count()).collect();
+        assert_eq!(map.rendered_to_raw_vec(), expected.as_slice());
+        assert_eq!(map.rendered_len(), source.chars().count());
+    }
     use super::*;
 
     /// A slice read on its own as block syntax (`2. a`, `# b`, an indent) maps as the paragraph

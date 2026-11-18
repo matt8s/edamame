@@ -921,7 +921,7 @@ fn image_cache_survives_reparse_on_unrelated_edit() {
         .set_decoded("cat.png", image::DynamicImage::new_rgba8(1, 1));
     assert!(matches!(
         st.images.status("cat.png"),
-        Some(DecodeStatus::Ready(_))
+        Some(DecodeStatus::Ready { .. })
     ));
 
     // Perform an edit that reparses — append a char at the document end.
@@ -931,7 +931,7 @@ fn image_cache_survives_reparse_on_unrelated_edit() {
     // The cache entry for cat.png should still be there.
     assert!(matches!(
         st.images.status("cat.png"),
-        Some(DecodeStatus::Ready(_))
+        Some(DecodeStatus::Ready { .. })
     ));
     // And the image block is still in the reparsed doc.
     assert_eq!(st.parsed.image_blocks.len(), 1);

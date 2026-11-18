@@ -76,6 +76,11 @@ The renderer has no internal length, node-count, or timeout bound, so a patholog
 
 ### Display math shares the same protections
 
+Inline math uses the same RaTeX panic guard, source cap, bundled fonts and SVG rasterizer.
+The parser retains at most 128 candidate inline formulas per document, composition declines paragraphs over 64 KiB, and no more than four image decodes are in flight at once.
+Ready inline rasters that exceed the available column width or 32 cell rows remain literal.
+These limits bound typesetting, not the readable document: over-budget source is still rendered as text.
+
 `$$...$$` blocks are rendered by RaTeX (`src/diagram/math.rs`), a pure-Rust KaTeX engine with no JS engine, headless browser, or HTTP client. The KaTeX fonts are compiled into the binary (`src/assets/katex/`) and registered in the shared fontdb, so nothing is fetched or read from disk to render a formula. Otherwise it mirrors Mermaid: pre-1.0 with known panic bugs, so wrapped in `catch_unwind` with a `terminal::ExpectedPanic` guard; no internal size bound, so `render_latex_svg` rejects sources over 64 KiB (`MAX_LATEX_SOURCE_BYTES`) at the one choke point for TUI and export; rasterized through the same `src/image/svg.rs` clamps; exported only as a normalized SVG `<img>` (`mermaid_export_never_emits_raw_svg_or_script`, `display_math_exports_as_an_svg_figure`).
 
 ### Syntax highlighting is bounded and cannot execute code
