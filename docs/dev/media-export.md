@@ -53,6 +53,39 @@ The security side of every path here — decode limits, remote consent and SSRF 
 - **Mermaid diagrams use synthetic cache keys.** `diagram::mermaid` renders Mermaid → SVG → PNG via `mermaid-rs-renderer` + `resvg`/`usvg`, keyed `diagram-mermaid-<sha256>` so a rendered diagram survives reparses. `mermaid-rs-renderer` is pinned exactly (`=0.2.2`: pre-1.0, known panics, rapid churn); `resvg`/`usvg` versions must match what it pulls in transitively so cargo doesn't compile two copies.
 - **Display math shares that pipeline.** `diagram::math` renders `$$...$$` via RaTeX, keyed `diagram-math-<sha256>`, through the same rasterizer and `DiagramSource`/decode-dispatch machinery (shared bits in `diagram::common`). It uses `render_to_svg(embed_glyphs = false)` — `<text>` output, **not** the `standalone`/`embed-fonts` features — so there is one font subsystem: the KaTeX faces are bundled (`src/assets/katex/`, SIL OFL) and registered into the shared fontdb in `image::svg`. `pin_generic_families` there is load-bearing for math too: RaTeX emits `\text{…}` as `font-family="sans-serif"`, and an unresolved generic (fontdb's default `Arial`, absent on Linux) renders that prose blank; once the generic resolves, usvg's per-glyph fallback reaches a system CJK font on its own. After rasterizing, `fit_latex_to_cell_grid` adds breathing room, flattens transparency onto the document background (halfblocks drop alpha), and centers the formula on a whole number of cell rows.
 
+## Measured inline math
+
+`DocParse::inline_math` retains at most 128 inline-math byte ranges and sources from the existing event stream.
+Dollar math needs no extra parse.
+For documents containing `\(`, `markdown::paren_math` first uses pulldown's events to identify prose openers outside code, HTML and links.
+Matched same-line formulas are protected as inert inline-HTML atoms in a private, byte-length-preserving parser shadow, then restored to math events with the original source spans and TeX bodies.
+Boundary padding is removed from text events before the AST sees them.
+This second pulldown pass prevents Markdown punctuation inside TeX from changing surrounding emphasis or links; it does not modify the document or shift offsets.
+The adapter keeps the original parse if any atom cannot be restored or an outside link changes identity.
+The AST retains the delimiter form separately, and `InlineColMap` uses the same adapter and literal delimiters.
+`ParsedDoc::measure_inline_math` composes eligible top-level paragraphs after ready decodes arrive.
+Its atom widths are raster widths rounded up to cells, independent of the length of the TeX source.
+Text and atomic boxes use `document::wrap`'s shared measured-width entry point, including its grapheme joints, punctuation rules and absorbed spaces.
+The resulting physical rows, per-character source positions, ascent/descent (the stored TeX baseline metric for real rasters, the centred fallback for legacy metric-less entries), and formula rectangles form one `InlineLayout`.
+They replace the normal parsed rows and rebuild the same source map, row origins and visual-row cache.
+`row_map` consumes the explicit positions rather than reparsing the blank image reservations.
+
+The paragraph is the raw-reveal unit.
+`EffectiveRows` replaces all its measured physical rows with its source lines; the painter skips the same range.
+Image snapshots include that reveal identity and translate ordinary images below it through the same effective geometry.
+Source-owning block IDs remain separate from Kitty placement IDs, so repeated formulas in one paragraph do not replace each other.
+
+Inline rasters use RaTeX text style, the hardened SVG path and the existing asynchronous image worker.
+Their keys include source, text-style version, terminal cell dimensions and theme foreground/background.
+Failures are memoized; document membership drives GC.
+There are at most four concurrent decodes, 128 eligible atoms per document, and a 64 KiB composition limit per paragraph.
+Unsupported contexts and formulas that do not fit remain literal.
+The first implementation deliberately leaves nested paragraphs and diff review on that fallback rather than guessing container geometry.
+
+- **The inline canvas is baseline-anchored, not centred, on the cell grid.** The RaTeX `DisplayList` height and depth give the exact TeX baseline in pixels before rasterizing (`math::render_latex_svg_inner` returns it with the SVG); `resolve_inline_latex` places that baseline on the calibrated prose baseline — an estimated `0.78 × cell_h` below the top of its prose row, a documented estimate rather than a terminal measurement — and reserves whole overhang rows above and descent rows below so nothing clips. The inline em is the calibrated `0.9 × cell_h` (a conservative constant, about 12.5% larger than the old `0.8`), keeping KaTeX-class x-heights in the 12–14 px band at a 32 px cell. Display math keeps its centred layout unchanged.
+- **The baseline metric travels atomically with the raster.** It rides in `LoadedImage::formula` (`image::loader::FormulaMetrics`) across the decode event and is stored in the cache's `Ready` entry itself, so it is inserted, evicted and GC'd with the pixels: a stale async result can neither attach metrics to a newer raster nor strip them from one. Composition (`measure_inline_math`) takes the atom's ascent as `baseline_px / cell_h` — the font cell is in the cache key, so the metric and the pixels always agree — and the aligned baseline flows through `compose` into `InlineFormula`, so painting, `row_map` and reveal all agree on the prose row. Only a legacy `Ready` entry without metrics (synthetic test images) keeps the documented centred `(h-1)/2` fallback.
+- **The key version is `inline-text-v2`.** v1 stored centred geometry; any entry under the old version is treated as stale rather than re-measured against the new canvas.
+
 ## Raw reveal of image blocks
 
 - **A revealed image block reserves one row per *source* line, not its image's rows.** A `Block::ImageBlock` otherwise reserves as many rows as the decoded image occupies, which clipped a short-wide diagram's source (issue #24), padded out a tall one, and left a one-line `![alt](url)` floating in blanks. **The gate is `is_image_block`, not `is_mermaid_block`** — both cases are the same bug. `EditorState::image_reveal` stashes an `ImageReveal { ordinal, url, rows }` for the block the cursor rests in, and `refresh_parsed`'s row override consults it **first** — ahead of the decode cache and the images-disabled collapse to 1 row — so the document reflows.

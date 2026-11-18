@@ -21,6 +21,9 @@ use crate::markdown::{
     RowOrigin,
 };
 
+mod inline_math;
+pub use inline_math::{InlineFormula, InlineLayout};
+
 /// Metadata for one `Block::ImageBlock`, for the image loader and placeholder.
 #[derive(Debug, Clone)]
 pub struct ImageBlockInfo {
@@ -39,6 +42,9 @@ pub struct ImageBlockInfo {
 /// rendered-line [`SourceMap`], and the block AST.  Rebuilt from scratch after every edit.
 #[derive(Debug, Clone)]
 pub struct ParsedDoc {
+    /// Measured inline formula rows, source maps and image placements.
+    pub inline_math: InlineLayout,
+    inline_math_sources: Vec<(Range<usize>, String)>,
     /// Rendered styled lines.
     pub lines: Vec<Line<'static>>,
     /// Where each of [`lines`](Self::lines) came from, 1:1 with it: the source lines it shows,
@@ -432,6 +438,8 @@ impl ParsedDoc {
         debug_assert_eq!(row_origins.len(), lines.len(), "rows and origins drifted");
         let row_count = lines.len();
         Self {
+            inline_math: InlineLayout::default(),
+            inline_math_sources: parse.inline_math,
             lines,
             row_origins,
             source: source.into(),

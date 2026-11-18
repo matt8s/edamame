@@ -43,7 +43,7 @@ pub struct RenderedViewState {
     pub image_snapshots: Vec<ImageLayoutSnapshot>,
     /// Cache key for `image_snapshots`: `(scroll, area, parsed_version)`. A match reuses the
     /// vector instead of repeating the O(lines × images) geometry scan.
-    pub image_snapshots_key: Option<(usize, Rect, u64)>,
+    pub image_snapshots_key: Option<crate::ui::image_view::ImageSnapshotKey>,
     /// Every visible Markdown link, captured at the end of the last render, for mouse
     /// hit-testing (plain click in Preview, Ctrl-click in Rendered/Raw).
     pub link_snapshots: Vec<LinkLayoutSnapshot>,
@@ -395,6 +395,9 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                     used += rows;
                 }
                 rows_used = used;
+                if let Some(range) = &stacked_range {
+                    virtual_idx = range.end.saturating_sub(1);
+                }
             } else if reveal_raw && is_big_h1_block && in_cursor_block {
                 // `# Title` on the first sub-line, the other big-text rows blanked, the last
                 // sub-line keeps the rendered rule.
@@ -752,20 +755,18 @@ impl<'a> StatefulWidget for RenderedView<'a> {
                 } else {
                     rows_used = 1;
                 }
+            } else if let Some(line) = editor.parsed.lines.get(virtual_idx) {
+                rows_used = render_line_from_visual(
+                    line,
+                    row_indent,
+                    area,
+                    buf,
+                    vis_y as u16,
+                    wrap,
+                    skip_rows,
+                ) as usize;
             } else {
-                if let Some(line) = editor.parsed.lines.get(virtual_idx) {
-                    rows_used = render_line_from_visual(
-                        line,
-                        row_indent,
-                        area,
-                        buf,
-                        vis_y as u16,
-                        wrap,
-                        skip_rows,
-                    ) as usize;
-                } else {
-                    break;
-                }
+                break;
             }
 
             // Lines that painted their own highlight (the revealed line, big-H1 / setext / diagram

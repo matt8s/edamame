@@ -234,6 +234,8 @@ pub struct EditorState {
     /// Font size in pixels from the detected image picker; the default mirrors
     /// `Picker::from_fontsize`'s Halfblocks default.
     pub image_font_size: (u16, u16),
+    /// Session capability, never persisted. Inline composition currently needs KittyDirect.
+    pub inline_math_supported: bool,
     /// Decoded-image cache keyed by URL, retained across reparses so ordinary edits don't
     /// invalidate the expensive `StatefulProtocol` encoding.  Filled by the decode worker.
     pub images: ImageCache,
@@ -452,6 +454,7 @@ impl EditorState {
             image_max_height,
             image_max_width,
             image_font_size,
+            inline_math_supported: false,
             images: ImageCache::new(),
             images_enabled: true,
             diagrams_enabled: true,
@@ -859,7 +862,13 @@ impl EditorState {
                         (block_lines[l], indent)
                     })
                     .collect();
-                EffectiveRows::with_reveal(&self.parsed, width, rendered..rendered + 1, first, &raw)
+                let replaced = self
+                    .parsed
+                    .inline_math
+                    .paragraphs
+                    .get(&rendered)
+                    .map_or(rendered..rendered + 1, |(range, _)| range.clone());
+                EffectiveRows::with_reveal(&self.parsed, width, replaced, first, &raw)
             }
             None => EffectiveRows::identity(&self.parsed, width),
         };
@@ -1058,6 +1067,14 @@ impl EditorState {
             Some(&mut self.render_cache),
         );
         self.parsed_reflow = reflow_paragraphs;
+        if self.diagrams_enabled && self.inline_math_supported {
+            self.parsed.measure_inline_math(
+                &self.images,
+                self.image_font_size,
+                self.viewport_width,
+                self.theme,
+            );
+        }
         self.parsed_version = self.parsed_version.wrapping_add(1);
         self.parsed_dirty = false;
         // Record the math-preview split so the row ⇄ source-line mapping paints the rendered
@@ -1081,6 +1098,13 @@ impl EditorState {
             .iter()
             .map(|i| i.url.clone())
             .collect();
+        live.extend(
+            self.parsed
+                .inline_math
+                .requests
+                .iter()
+                .map(|i| i.url.clone()),
+        );
         if let Some(parsed_new) = self.diff.as_ref().and_then(|d| d.parsed_new.as_ref()) {
             live.extend(parsed_new.image_blocks.iter().map(|i| i.url.clone()));
         }
@@ -1405,6 +1429,401 @@ mod tests {
             })
             .filter(|s| !s.is_empty())
             .collect()
+    }
+
+    #[test]
+    fn decoded_inline_math_flows_between_prose_without_changing_source() {
+        let source = "Before $x^2$ after.\n";
+        let mut state = EditorState::new(Buffer::from_str(source), theme());
+        state.inline_math_supported = true;
+        state.refresh_parsed();
+        let key = state.parsed.inline_math.requests[0].url.clone();
+        let loaded = crate::diagram::math::resolve_inline_latex(
+            key.clone(),
+            "x^2",
+            Some((10, 20)),
+            [204, 204, 204, 255],
+            [26, 26, 26, 255],
+        )
+        .unwrap();
+        state.images.set_decoded(&key, loaded.image);
+        state.refresh_parsed();
+        let shown = line_texts(&state).join("");
+        assert!(
+            !shown.contains('$'),
+            "decoded math must occupy measured cells: {shown:?}"
+        );
+        assert!(shown.contains("Before "));
+        assert!(shown.contains(" after."));
+        assert_eq!(state.buffer.contents(), source);
+    }
+
+    fn inline_state(source: &str, width: usize) -> EditorState {
+        let mut state = EditorState::new(Buffer::from_str(source), theme());
+        state.inline_math_supported = true;
+        state.set_viewport_width(width);
+        state.refresh_parsed();
+        for info in state.parsed.inline_math.requests.clone() {
+            let crate::diagram::DiagramSource::InlineLatex(src) = info.source.unwrap() else {
+                panic!()
+            };
+            let image = crate::diagram::math::resolve_inline_latex(
+                info.url.clone(),
+                &src,
+                Some(state.image_font_size),
+                [204, 204, 204, 255],
+                [26, 26, 26, 255],
+            )
+            .unwrap()
+            .image;
+            state.images.set_decoded(&info.url, image);
+        }
+        state.refresh_parsed();
+        state
+    }
+
+    #[test]
+    fn inline_math_has_measured_image_snapshots_beside_prose() {
+        let state = inline_state("Before $x^2$ middle $y_1$ after.\n", 80);
+        let snapshots = crate::ui::image_view::build_snapshots(
+            &state,
+            ratatui::layout::Rect::new(31, 2, 80, 20),
+            0,
+        );
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "each formula must reach the normal protocol painter"
+        );
+        assert_eq!(snapshots[0].rect.x, 31 + "Before ".len() as u16);
+        assert!(snapshots[0].rect.right() < snapshots[1].rect.x);
+        assert!(snapshots.iter().all(|s| s.rect.width < 15));
+    }
+
+    #[test]
+    fn inline_math_reveal_replaces_the_whole_measured_paragraph() {
+        let source = "Before $x^2$ middle $y_1$ after with more words to wrap.\n";
+        let mut state = inline_state(source, 22);
+        assert!(state.parsed.line_count() > 2);
+        state.mode = Mode::Rendered;
+        state.place_cursor(2);
+        state.cursor_block_entered_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let effective = state.effective_rows(22);
+        let paragraph = state.parsed.source_map.rendered_lines_for_byte(2);
+        assert_eq!(
+            effective.block_rendered(),
+            Some(paragraph),
+            "raw reveal must replace every measured physical row"
+        );
+    }
+
+    #[test]
+    fn inline_math_metrics_are_keyed_by_cell_size() {
+        let mut state = inline_state("Before $x^2$ after.\n", 80);
+        let old = state.parsed.inline_math.requests[0].url.clone();
+        state.image_font_size = (12, 30);
+        state.refresh_parsed();
+        assert_ne!(state.parsed.inline_math.requests[0].url, old);
+        assert!(
+            state.parsed.inline_math.formulas.is_empty(),
+            "new cell metrics require fresh rasterization"
+        );
+        assert!(line_texts(&state).join("").contains("$x^2$"));
+        assert!(
+            state.images.status(&old).is_none(),
+            "GC removes stale geometry"
+        );
+    }
+
+    #[test]
+    fn inline_math_theme_change_invalidates_ready_pixels() {
+        let mut state = inline_state("Before $x^2$ after.", 80);
+        let old = state.parsed.inline_math.requests[0].url.clone();
+        let mut theme = state.theme().clone();
+        theme.palette.text = ratatui::style::Color::Rgb(3, 7, 11);
+        theme.palette.bg = ratatui::style::Color::Rgb(17, 19, 23);
+        state.set_theme(Box::leak(Box::new(theme)));
+        assert_ne!(state.parsed.inline_math.requests[0].url, old);
+        assert!(state.parsed.inline_math.formulas.is_empty());
+        assert!(state.images.status(&old).is_none());
+    }
+
+    #[test]
+    fn paren_math_raster_prose_and_mappings_roundtrip() {
+        let source = r"Before \(x^2\) middle \(y_1\) after $z$.";
+        let mut state = inline_state(source, 80);
+        assert_eq!(state.parsed.inline_math.formulas.len(), 3);
+        assert_eq!(state.buffer.contents(), source);
+        for word in ["Before", "middle", "after"] {
+            let pos = row_map::RawPos {
+                line: 0,
+                col: source.find(word).unwrap(),
+            };
+            let row = row_map::row_for_pos(&state.parsed, 0, pos);
+            let col = row_map::raw_to_rendered_col(&state.parsed, 0, row, pos).unwrap();
+            let text: Vec<_> = state.parsed.lines[row]
+                .spans
+                .iter()
+                .flat_map(|s| s.content.chars())
+                .collect();
+            assert_eq!(text[col], word.chars().next().unwrap());
+            assert_eq!(
+                row_map::rendered_to_raw_col(&state.parsed, 0, row, col),
+                pos
+            );
+        }
+        state.mode = Mode::Rendered;
+        state.place_cursor(source.find("after").unwrap());
+        state.cursor_block_entered_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let effective = state.effective_rows(80);
+        assert_eq!(
+            effective.block_rendered(),
+            Some(state.parsed.source_map.rendered_lines_for_byte(0))
+        );
+        assert_eq!(effective.raw_lines(), 0..1);
+        assert_eq!(state.buffer.contents(), source);
+    }
+
+    #[test]
+    fn inline_math_unsupported_or_disabled_retains_literal_source() {
+        let mut state = inline_state("Before $x^2$ after.\n", 80);
+        assert!(!state.parsed.inline_math.formulas.is_empty());
+        state.inline_math_supported = false;
+        state.refresh_parsed();
+        assert!(state.parsed.inline_math.formulas.is_empty());
+        assert!(line_texts(&state).join("").contains("$x^2$"));
+        state.inline_math_supported = true;
+        state.diagrams_enabled = false;
+        state.refresh_parsed();
+        assert!(state.parsed.inline_math.requests.is_empty());
+        assert!(line_texts(&state).join("").contains("$x^2$"));
+    }
+
+    #[test]
+    fn inline_math_cursor_maps_to_visible_prose_baseline() {
+        let source = r"Before $\begin{matrix}a\\b\\c\\d\end{matrix}$ after.";
+        let state = inline_state(source, 80);
+        assert!(state.parsed.inline_math.formulas[0].height >= 3);
+        let block = state.parsed.source_map.block_for_byte(0).unwrap();
+        let raw = source.find("after").unwrap();
+        let pos = row_map::RawPos { line: 0, col: raw };
+        let row = row_map::row_for_pos(&state.parsed, block, pos);
+        let col = row_map::raw_to_rendered_col(&state.parsed, block, row, pos).unwrap();
+        let line = &state.parsed.lines[row];
+        let shown: Vec<_> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert_eq!(
+            shown[col], 'a',
+            "cursor must map to the text baseline, not an ascent padding row"
+        );
+        assert_eq!(
+            row_map::rendered_to_raw_col(&state.parsed, block, row, col),
+            pos
+        );
+    }
+
+    #[test]
+    fn inline_math_absorbed_space_belongs_to_the_next_visible_band() {
+        let source = "abc $x$ after";
+        let mut state = EditorState::new(Buffer::from_str(source), theme());
+        state.inline_math_supported = true;
+        state.set_viewport_width(8);
+        let key = state.parsed.inline_math.requests[0].url.clone();
+        state
+            .images
+            .set_decoded(&key, image::DynamicImage::new_rgba8(40, 60));
+        state.refresh_parsed();
+        let space = row_map::RawPos { line: 0, col: 7 };
+        let next = row_map::RawPos { line: 0, col: 8 };
+        let row = row_map::row_for_pos(&state.parsed, 0, space);
+        assert_eq!(row, row_map::row_for_pos(&state.parsed, 0, next));
+        assert_ne!(
+            state.parsed.row_origins()[row].cols,
+            crate::markdown::ColOrigin::Chrome
+        );
+        assert_eq!(
+            row_map::raw_to_rendered_col(&state.parsed, 0, row, space),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn inline_math_wrap_keeps_graphemes_and_shared_text_breaks() {
+        let family = "👩‍👩‍👧‍👦";
+        let state = inline_state(&format!("abcde{family} $x^2$ end"), 10);
+        let rows = line_texts(&state);
+        assert!(
+            rows.iter().any(|r| r.contains(family)),
+            "family cluster must stay on one physical row: {rows:?}"
+        );
+        for text in ["日本、語。", "e\u{301}e\u{301}e\u{301}", "one\u{a0}two"] {
+            let src = format!("{text} $x^2$ end");
+            let state = inline_state(&src, 10);
+            let rows = line_texts(&state);
+            assert!(!rows.iter().any(|r| r.starts_with('\u{301}')), "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn inline_math_atom_budget_bounds_a_single_large_paragraph() {
+        let source = "word $x^2$ ".repeat(1000);
+        let mut state = EditorState::new(Buffer::from_str(&source), theme());
+        state.inline_math_supported = true;
+        state.refresh_parsed();
+        assert!(
+            state.parsed.inline_math.requests.len() <= 128,
+            "one visible paragraph must not schedule an unbounded cache"
+        );
+        assert_eq!(state.buffer.contents(), source);
+    }
+
+    #[test]
+    fn inline_math_snapshot_cache_tracks_dwell_and_moves_images_below() {
+        let mut state = inline_state(
+            "Before $\\begin{matrix}a\\\\b\\\\c\\\\d\\end{matrix}$ after.\n\n![a](a.png)\n",
+            80,
+        );
+        state
+            .images
+            .set_decoded("a.png", image::DynamicImage::new_rgba8(10, 20));
+        state.refresh_parsed();
+        state.mode = Mode::Rendered;
+        state.place_cursor(2);
+        state.cursor_block_entered_at = Some(std::time::Instant::now());
+        let version = state.parsed_version;
+        let area = ratatui::layout::Rect::new(31, 2, 80, 30);
+        let mut snapshots = Vec::new();
+        let mut key = None;
+        crate::ui::image_view::build_snapshots_cached(&state, area, 0, &mut snapshots, &mut key);
+        let original = snapshots
+            .iter()
+            .find(|s| s.url == "a.png")
+            .unwrap()
+            .natural_top;
+        assert_eq!(snapshots.len(), 2);
+        state.cursor_block_entered_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        crate::ui::image_view::build_snapshots_cached(&state, area, 0, &mut snapshots, &mut key);
+        assert_eq!(
+            state.parsed_version, version,
+            "dwell must not need a reparse"
+        );
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "dwell invalidates cached inline placements"
+        );
+        let delta = state.effective_rows(80).total_visual_rows() as isize
+            - state.parsed.total_visual_rows(80) as isize;
+        assert_eq!(snapshots[0].natural_top, original + delta);
+    }
+
+    #[test]
+    fn inline_math_reflow_prose_roundtrips_at_every_width() {
+        let source = "Alpha $x^2$ omega delta\nmore $y_1$ tail.\n";
+        for width in [8, 12, 22, 80] {
+            for reflow in [false, true] {
+                let mut state = inline_state(source, width);
+                state.set_reflow(reflow);
+                let block = state.parsed.source_map.block_for_byte(0).unwrap();
+                for word in ["Alpha", "omega", "delta", "more", "tail"] {
+                    let byte = source.find(word).unwrap();
+                    let line = source[..byte].bytes().filter(|b| *b == b'\n').count();
+                    let col = source[..byte].rsplit('\n').next().unwrap().chars().count();
+                    let pos = row_map::RawPos { line, col };
+                    let row = row_map::row_for_pos(&state.parsed, block, pos);
+                    let shown_col =
+                        row_map::raw_to_rendered_col(&state.parsed, block, row, pos).unwrap();
+                    let shown: Vec<_> = state.parsed.lines[row]
+                        .spans
+                        .iter()
+                        .flat_map(|s| s.content.chars())
+                        .collect();
+                    assert_eq!(
+                        shown.get(shown_col),
+                        word.chars().next().as_ref(),
+                        "width {width}, reflow {reflow}, word {word}"
+                    );
+                    assert_eq!(
+                        row_map::rendered_to_raw_col(&state.parsed, block, row, shown_col),
+                        pos
+                    );
+                    let owned = row_map::lines_of_row(&state.parsed, block, row).unwrap();
+                    assert!(owned.contains(&(line as u32)), "band provenance must contain its text: width {width}, reflow {reflow}, word {word}");
+                    let expected_first = (0..shown.len())
+                        .map(|c| row_map::rendered_to_raw_col(&state.parsed, block, row, c).line)
+                        .min()
+                        .unwrap();
+                    assert_eq!(
+                        row_map::line_for_row(&state.parsed, block, row),
+                        expected_first
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_math_literals_and_display_blocks_keep_source_semantics() {
+        for source in [
+            r"Cost: \$5.",
+            "Cost: $5 and $10 total.",
+            "`$x$` unmatched $",
+            "```\n$x$ and $$y$$\n```\n",
+            "| a |\n|---|\n| $x$ |\n",
+            "> quote $x$\n",
+            "- list $x$\n",
+        ] {
+            let mut state = EditorState::new(Buffer::from_str(source), theme());
+            state.inline_math_supported = true;
+            state.refresh_parsed();
+            assert!(state.parsed.inline_math.requests.is_empty(), "{source:?}");
+            assert_eq!(state.buffer.contents(), source);
+        }
+        let source = "Before $x^2$ after.\n\n$$\ny^2\n$$\n";
+        let state = inline_state(source, 80);
+        assert_eq!(state.parsed.inline_math.formulas.len(), 1);
+        assert!(state
+            .parsed
+            .image_blocks
+            .iter()
+            .any(|i| matches!(i.source, Some(crate::diagram::DiagramSource::Latex(_)))));
+        assert_eq!(state.buffer.contents(), source);
+    }
+
+    #[test]
+    fn inline_math_failure_and_edits_remain_readable_and_source_exact() {
+        let source = "Before $\\unknowncommand{x}$ after.\n";
+        let mut state = EditorState::new(Buffer::from_str(source), theme());
+        state.inline_math_supported = true;
+        state.refresh_parsed();
+        let info = state.parsed.inline_math.requests[0].clone();
+        assert!(crate::diagram::math::resolve_inline_latex(
+            info.url.clone(),
+            r"\unknowncommand{x}",
+            Some(state.image_font_size),
+            [204, 204, 204, 255],
+            [26, 26, 26, 255],
+        )
+        .is_err());
+        state.images.set_failed(&info.url, "unsupported".into());
+        state.refresh_parsed();
+        assert!(line_texts(&state)
+            .join("")
+            .contains(r"$\unknowncommand{x}$"));
+        assert!(!state.images.request(&info.url), "failure must be memoized");
+        for _ in 0..5 {
+            state.place_cursor(7);
+            crate::editor::edit_ops::apply(
+                &mut state,
+                crate::config::Action::InsertChar('z'),
+                24,
+                80,
+            );
+            crate::editor::edit_ops::apply(&mut state, crate::config::Action::Undo, 24, 80);
+            assert_eq!(state.buffer.contents(), source);
+        }
     }
 
     /// Reflow is on by default in both Preview and Rendered, off in Raw, and the master switch

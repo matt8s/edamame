@@ -232,8 +232,19 @@ fn walk_rendered_rows(
     if lines.is_empty() {
         return None;
     }
-    let (mut idx, mut first_sub_row) =
-        state.rendered_line_at_visual_row(state.scroll, viewport_width);
+    let effective = state.effective_rows(viewport_width);
+    let (mut idx, mut first_sub_row) = match effective.line_at_visual_row(state.scroll) {
+        crate::editor::effective_rows::RowHit::Rendered { line, sub } => (line, sub),
+        crate::editor::effective_rows::RowHit::Raw { raw_line, sub } => {
+            let range = effective.block_rendered()?;
+            let first = effective.raw_lines().start;
+            (
+                range.start,
+                effective.raw_line_visual_row(raw_line) - effective.raw_line_visual_row(first)
+                    + sub,
+            )
+        }
+    };
     let reveal = cursor_reveal(state);
     let mut y = 0usize;
     while idx < lines.len() {
@@ -245,7 +256,10 @@ fn walk_rendered_rows(
             return Some((idx, first_sub_row + row - y));
         }
         y += used;
-        idx += 1;
+        idx = effective
+            .block_rendered()
+            .filter(|r| r.contains(&idx))
+            .map_or(idx + 1, |r| r.end);
         first_sub_row = 0;
     }
     None
@@ -265,7 +279,7 @@ struct CursorReveal {
 
 /// The cursor block's [`CursorReveal`]; `None` while the reveal is off.
 fn cursor_reveal(state: &EditorState) -> Option<CursorReveal> {
-    if !state.cursor_block_revealed() {
+    if !reveal_shown(state) {
         return None;
     }
     let block_idx = state.cursor_block_idx?;
@@ -428,6 +442,45 @@ pub(super) fn table_cell_char_range_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inline_math_clicks_roundtrip_across_scroll_and_resize() {
+        let source = "Alpha $x^2$ omega delta more words before the tail.\n";
+        let theme = Box::leak(Box::new(crate::config::Theme::default()));
+        let mut state =
+            crate::editor::EditorState::new(crate::document::Buffer::from_str(source), theme);
+        state.inline_math_supported = true;
+        state.refresh_parsed();
+        for info in state.parsed.inline_math.requests.clone() {
+            let Some(crate::diagram::DiagramSource::InlineLatex(src)) = info.source else {
+                panic!()
+            };
+            let loaded = crate::diagram::math::resolve_inline_latex(
+                info.url.clone(),
+                &src,
+                Some(state.image_font_size),
+                [204, 204, 204, 255],
+                [26, 26, 26, 255],
+            )
+            .unwrap();
+            state.images.set_decoded(&info.url, loaded.image);
+        }
+        for width in [12, 22, 40] {
+            state.set_viewport_width(width);
+            let raw = source.find("tail").unwrap();
+            let block = state.parsed.source_map.block_for_byte(raw).unwrap();
+            let pos = crate::document::row_map::RawPos { line: 0, col: raw };
+            let row = crate::document::row_map::row_for_pos(&state.parsed, block, pos);
+            let col = crate::document::row_map::raw_to_rendered_col(&state.parsed, block, row, pos)
+                .unwrap();
+            let visual = state.parsed.visual_rows_before(row, width);
+            state.scroll = visual.saturating_sub(1);
+            assert_eq!(
+                super::click_to_char_offset(&state, col, visual - state.scroll, width),
+                Some(raw)
+            );
+            assert_eq!(state.buffer.contents(), source);
+        }
+    }
     use super::*;
     use crate::config::Theme;
     use crate::document::Buffer;

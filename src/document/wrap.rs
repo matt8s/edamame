@@ -73,11 +73,16 @@ where
 /// Largest `n` with `chars[start..start + n]` fitting `cell_budget`.  A first char wider
 /// than the budget still returns 1, so the wrap loop makes progress at narrow viewports;
 /// the renderer clips the overflow.
-fn chars_within_cell_budget(chars: &[(char, Style)], start: usize, cell_budget: usize) -> usize {
+fn chars_within_cell_budget(
+    chars: &[(char, Style)],
+    widths: Option<&[usize]>,
+    start: usize,
+    cell_budget: usize,
+) -> usize {
     let mut total = 0usize;
     let mut count = 0usize;
-    for (ch, _) in &chars[start..] {
-        let w = char_cells(*ch);
+    for (i, (ch, _)) in chars.iter().enumerate().skip(start) {
+        let w = widths.map_or_else(|| char_cells(*ch), |w| w[i]);
         if count > 0 && total + w > cell_budget {
             break;
         }
@@ -147,12 +152,23 @@ fn is_cluster_boundary(joints: Option<&[Joint]>, i: usize) -> bool {
 /// Pull `end` back to the nearest cluster boundary so a hard break can't sever a cluster.
 /// Never returns `start` — a row holding one over-wide cluster must still make progress,
 /// and the renderer clips the overflow.
-fn snap_to_cluster_boundary(joints: Option<&[Joint]>, start: usize, end: usize) -> usize {
+fn snap_to_cluster_boundary(
+    joints: Option<&[Joint]>,
+    start: usize,
+    end: usize,
+    atomic_overflow: bool,
+) -> usize {
     let mut snapped = end;
     while snapped > start && !is_cluster_boundary(joints, snapped) {
         snapped -= 1;
     }
-    if snapped == start {
+    if snapped == start && atomic_overflow {
+        let mut boundary = end;
+        while !is_cluster_boundary(joints, boundary) {
+            boundary += 1;
+        }
+        boundary
+    } else if snapped == start {
         end
     } else {
         snapped
@@ -296,6 +312,29 @@ pub fn visual_rows_of_chars(
     width: usize,
     indent: Indent,
 ) -> Vec<(usize, usize, usize)> {
+    measured_rows(chars, None, width, indent)
+}
+
+/// The same wrap for text characters and atomic inline boxes. `widths` is
+/// measured in cells, not inferred from source or a placeholder's glyph.
+/// A box occupies one element (U+FFFC for break classification only); it
+/// is never expanded into fake source text before wrapping.
+pub fn visual_rows_of_measured_chars(
+    chars: &[(char, Style)],
+    widths: &[usize],
+    width: usize,
+    indent: Indent,
+) -> Vec<(usize, usize, usize)> {
+    assert_eq!(chars.len(), widths.len());
+    measured_rows(chars, Some(widths), width, indent)
+}
+
+fn measured_rows(
+    chars: &[(char, Style)],
+    widths: Option<&[usize]>,
+    width: usize,
+    indent: Indent,
+) -> Vec<(usize, usize, usize)> {
     let mut rows = Vec::new();
     if width == 0 {
         rows.push((0, chars.len(), chars.len()));
@@ -316,13 +355,14 @@ pub fn visual_rows_of_chars(
             break;
         }
         let row_width = width.saturating_sub(indent.row(row_idx)).max(1);
-        let n_chars = chars_within_cell_budget(chars, start, row_width);
+        let n_chars = chars_within_cell_budget(chars, widths, start, row_width);
         let remaining = chars.len() - start;
         let (row_end, next_start) = if n_chars >= remaining {
             (chars.len(), chars.len())
         } else {
             // Pull the budget back so a hard break falls between clusters, not inside one.
-            let window_end = snap_to_cluster_boundary(joints, start, start + n_chars);
+            let window_end =
+                snap_to_cluster_boundary(joints, start, start + n_chars, widths.is_some());
             // A row never ends on whitespace alone: a break after a leading pad (a code
             // row's pad cell, an indented raw line) before a word too long to fit would
             // leave a blank row and fit nothing more on the next, so that word hard-breaks
@@ -333,7 +373,7 @@ pub fn visual_rows_of_chars(
             // would win and send it down alone.  (An ASCII word ending exactly at the edge
             // still goes down a row: filling the row would absorb the space after it, and a
             // reveal that re-wraps the row could then put a click on that cell-less space.)
-            let edge_space = chars[window_end].0 == ' '
+            let edge_space = chars.get(window_end).is_some_and(|c| c.0 == ' ')
                 && chars[start..window_end]
                     .iter()
                     .rev()

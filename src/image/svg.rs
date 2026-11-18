@@ -323,7 +323,7 @@ const MAX_RASTER_PIXELS: u64 = 4_000_000;
 /// Takes the *rounded* pixel dimensions rather than natural size × scale, so flooring the result
 /// stays within budget — the `ceil` deriving those dimensions would otherwise push a budget-fitting
 /// scale back over the line by a pixel per axis.
-fn budget_shrink(px_w: u32, px_h: u32) -> f64 {
+pub(crate) fn budget_shrink(px_w: u32, px_h: u32) -> f64 {
     let (w, h) = (f64::from(px_w), f64::from(px_h));
     let mut shrink = 1.0f64;
     let longest = w.max(h);

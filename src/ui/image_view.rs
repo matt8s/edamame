@@ -27,6 +27,8 @@ use crate::terminal::ImageProtocol;
 pub struct ImageLayoutSnapshot {
     /// Virtual-block index in the current `ParsedDoc::source_map`.
     pub block_idx: usize,
+    /// Protocol placement namespace, separate from the source-owning block.
+    pub placement_idx: usize,
     /// Alt text for the fallback placeholder.  Consumed only by tests; the live placeholder
     /// path is in `ui::rendered_view`.
     #[allow(dead_code)]
@@ -41,6 +43,8 @@ pub struct ImageLayoutSnapshot {
     /// top so `paint_images` can tell partial visibility from full.
     pub natural_top: isize,
 }
+
+pub type ImageSnapshotKey = (usize, Rect, u64, Option<(usize, usize)>, usize);
 
 /// What a `(col, row)` click falls on inside an image block.  Used only by this module's
 /// tests today; kept for when click-on-image affordances land.
@@ -91,10 +95,17 @@ pub fn build_snapshots_cached(
     area: Rect,
     scroll: usize,
     snapshots: &mut Vec<ImageLayoutSnapshot>,
-    cache_key: &mut Option<(usize, Rect, u64)>,
+    cache_key: &mut Option<ImageSnapshotKey>,
 ) {
-    let key = (scroll, area, state.parsed_version);
-    if *cache_key == Some(key) {
+    let effective = state.effective_rows(area.width as usize);
+    let key = (
+        scroll,
+        area,
+        state.parsed_version,
+        effective.block_rendered().map(|r| (r.start, r.end)),
+        effective.total_visual_rows(),
+    );
+    if cache_key.as_ref() == Some(&key) {
         return;
     }
     *snapshots = build_snapshots(state, area, scroll);
@@ -107,7 +118,8 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         return out;
     }
     let width = area.width as usize;
-    let total_rows = state.parsed.total_visual_rows(width);
+    let effective = state.effective_rows(width);
+    let total_rows = effective.total_visual_rows();
     if scroll >= total_rows {
         return out;
     }
@@ -122,7 +134,7 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         }
         // Where the block's top row lands on screen.  `visual_rows_before` is O(1) once the
         // per-frame cache is warm; a loop here would re-measure every preceding line per tick.
-        let block_top = state.parsed.visual_rows_before(rendered_range.start, width);
+        let block_top = effective.rendered_line_visual_row(rendered_range.start);
         let y_offset: isize = block_top as isize - scroll as isize;
 
         let reserved = rendered_range.end.saturating_sub(rendered_range.start) as isize;
@@ -159,6 +171,7 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
         let rect_y = image_top.max(0).min(u16::MAX as isize) as u16;
         out.push(ImageLayoutSnapshot {
             block_idx: info.block_idx,
+            placement_idx: info.block_idx,
             alt: info.alt.clone(),
             url: info.url.clone(),
             rect: Rect {
@@ -168,6 +181,31 @@ pub fn build_snapshots(state: &EditorState, area: Rect, scroll: usize) -> Vec<Im
                 height: (reserved - source_rows_below).max(0).min(u16::MAX as isize) as u16,
             },
             natural_top: image_top,
+        });
+    }
+    let revealed = effective.block_rendered();
+    for (ordinal, formula) in state.parsed.inline_math.formulas.iter().enumerate() {
+        if revealed.as_ref().is_some_and(|r| r.contains(&formula.row)) {
+            continue;
+        }
+        let top = effective.rendered_line_visual_row(formula.row) as isize;
+        let top = area.y as isize + top - scroll as isize;
+        if top + formula.height as isize <= area.y as isize || top >= area.bottom() as isize {
+            continue;
+        }
+        out.push(ImageLayoutSnapshot {
+            // A disjoint placement namespace; these are not image blocks.
+            block_idx: formula.block,
+            placement_idx: (1usize << 30) + ordinal,
+            alt: String::new(),
+            url: formula.url.clone(),
+            rect: Rect::new(
+                area.x + formula.col,
+                top.max(0) as u16,
+                formula.width,
+                formula.height,
+            ),
+            natural_top: top,
         });
     }
     out
@@ -243,6 +281,7 @@ pub fn build_diff_snapshots(
             let rect_y = image_top.max(0).min(u16::MAX as isize) as u16;
             out.push(ImageLayoutSnapshot {
                 block_idx: info.block_idx,
+                placement_idx: info.block_idx,
                 alt: info.alt.clone(),
                 url: info.url.clone(),
                 rect: Rect {
@@ -511,7 +550,7 @@ fn paint_direct_placement(
     // The carrier cell has to exist before the transmit is taken: taking it and then failing to
     // write the symbol would drop the payload for good.
     let cell = buf.cell_mut((dst.x, dst.y))?;
-    let placement_id = crate::image::kitty_direct::placement_id(snap.block_idx);
+    let placement_id = crate::image::kitty_direct::placement_id(snap.placement_idx);
     let transmit = direct.transmit.take();
     let symbol = crate::image::kitty_direct::place(
         direct.id,
@@ -829,6 +868,7 @@ mod tests {
         fn snap(url: &str, top: u16, height: u16) -> ImageLayoutSnapshot {
             ImageLayoutSnapshot {
                 block_idx: 0,
+                placement_idx: 0,
                 alt: url.into(),
                 url: url.into(),
                 rect: Rect::new(0, top, AREA.width, height),
@@ -841,6 +881,7 @@ mod tests {
         fn snap_at(url: &str, natural_top: isize, height: u16) -> ImageLayoutSnapshot {
             ImageLayoutSnapshot {
                 block_idx: 0,
+                placement_idx: 0,
                 alt: url.into(),
                 url: url.into(),
                 rect: Rect::new(0, natural_top.max(0) as u16, AREA.width, height),
@@ -858,6 +899,7 @@ mod tests {
         ) -> ImageLayoutSnapshot {
             ImageLayoutSnapshot {
                 block_idx,
+                placement_idx: block_idx,
                 ..snap_at(url, natural_top, height)
             }
         }
@@ -959,6 +1001,77 @@ mod tests {
                 };
                 paint_images(snaps, ctx);
                 buf
+            }
+        }
+
+        #[test]
+        #[allow(deprecated)] // Explicit font metrics, no terminal capability probe in tests.
+        fn inline_math_direct_placements_preserve_the_prose_cells() {
+            let source = "A $x^2$ B $y_1$ C";
+            let theme = Box::leak(Box::new(crate::config::Theme::default()));
+            let mut state = EditorState::new(crate::document::Buffer::from_str(source), theme);
+            state.inline_math_supported = true;
+            state.set_viewport_width(AREA.width as usize);
+            state.refresh_parsed();
+            for info in state.parsed.inline_math.requests.clone() {
+                let Some(crate::diagram::DiagramSource::InlineLatex(src)) = info.source else {
+                    panic!()
+                };
+                let image = crate::diagram::math::resolve_inline_latex(
+                    info.url.clone(),
+                    &src,
+                    Some(state.image_font_size),
+                    [204, 204, 204, 255],
+                    [26, 26, 26, 255],
+                )
+                .unwrap()
+                .image;
+                state.images.set_decoded(&info.url, image);
+            }
+            state.refresh_parsed();
+            let snaps = build_snapshots(&state, AREA, 0);
+            assert_eq!(snaps.len(), 2);
+            assert_eq!(snaps[0].block_idx, snaps[1].block_idx);
+            assert_ne!(snaps[0].placement_idx, snaps[1].placement_idx);
+            let mut h = Harness::direct(&[]);
+            let (tx, _rx) = mpsc::channel();
+            state.images.attach_resize_sender(tx);
+            h.images = state.images;
+            h.native = Picker::from_fontsize(state.image_font_size.into());
+            h.native.set_protocol_type(ProtocolType::Iterm2);
+            h.halfblocks = Picker::from_fontsize(state.image_font_size.into());
+            h.halfblocks.set_protocol_type(ProtocolType::Halfblocks);
+            let mut buf = TuiBuf::empty(AREA);
+            ratatui::widgets::Paragraph::new(state.parsed.lines.clone()).render(AREA, &mut buf);
+            let before = buf.clone();
+            paint_images(
+                &snaps,
+                PaintContext {
+                    area: AREA,
+                    buf: &mut buf,
+                    images: &mut h.images,
+                    native_picker: Some(&h.native),
+                    halfblocks_picker: Some(&h.halfblocks),
+                    native_protocol: Some(ImageProtocol::KittyDirect),
+                    is_scrolling: false,
+                    modal_open: false,
+                    suppress_block_idx: None,
+                    bg: Color::Reset,
+                },
+            );
+            for snap in &snaps {
+                assert!(
+                    symbol_at(&buf, snap.rect).contains("a=p"),
+                    "actual direct placement must be emitted"
+                );
+            }
+            for y in AREA.y..AREA.bottom() {
+                for x in AREA.x..AREA.right() {
+                    let original = before.cell((x, y)).unwrap().symbol();
+                    if ["A", "B", "C"].contains(&original) {
+                        assert_eq!(buf.cell((x, y)).unwrap().symbol(), original);
+                    }
+                }
             }
         }
 
@@ -1648,6 +1761,7 @@ mod tests {
     fn hit_test_matches_inside_rect_only() {
         let snap = ImageLayoutSnapshot {
             block_idx: 3,
+            placement_idx: 3,
             alt: "x".into(),
             url: "x.png".into(),
             rect: Rect::new(2, 4, 10, 6),
@@ -1673,6 +1787,7 @@ mod tests {
     fn snap_with_top(natural_top: isize, width: u16, height: u16) -> ImageLayoutSnapshot {
         ImageLayoutSnapshot {
             block_idx: 0,
+            placement_idx: 0,
             alt: "mermaid diagram".into(),
             url: "diagram-mermaid-deadbeef".into(),
             rect: Rect {

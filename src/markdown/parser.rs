@@ -75,6 +75,8 @@ pub struct DocParse {
     pub link_labels: Vec<String>,
     /// The numbers GitHub renders the document's footnote references as, for heading slugs.
     pub footnote_numbers: FootnoteNumbers,
+    /// Bounded inline formula sources and exact byte spans from this same pass.
+    pub inline_math: Vec<(Range<usize>, String)>,
 }
 
 /// [`parse_raw_with_ranges`] with the rest of [`DocParse`].  `ParsedDoc::build`'s entry point.
@@ -90,13 +92,14 @@ pub fn parse_document(text: &str) -> DocParse {
         .collect();
     let mut events = EventStream::new(text, parser.into_offset_iter());
     let blocks = parse_blocks(&mut events, true);
-    let (ranges, line_starts, footnote_numbers) = events.into_parts();
+    let (ranges, line_starts, footnote_numbers, inline_math) = events.into_parts();
     DocParse {
         blocks,
         ranges,
         line_starts,
         link_labels,
         footnote_numbers,
+        inline_math,
     }
 }
 
@@ -811,12 +814,14 @@ where
                 inlines.push(Inline::Math {
                     source: source.into_string(),
                     display: false,
+                    parenthesized: events.last_text().starts_with(r"\("),
                 });
             }
             Event::DisplayMath(source) => {
                 inlines.push(Inline::Math {
                     source: source.into_string(),
                     display: true,
+                    parenthesized: false,
                 });
             }
             // A list item's paragraph takes its task box before its text is parsed, so one
@@ -1032,6 +1037,7 @@ mod tests {
                 inlines: vec![Inline::Math {
                     source: "\nx^2 + y^2 = z^2\n".into(),
                     display: true,
+                    parenthesized: false,
                 }],
                 // The formula's later lines continue the one math span begun on line 0, but its
                 // body line is a row of the ` math ` block it renders as, with its own column.
@@ -1706,6 +1712,7 @@ mod tests {
                 Inline::Math {
                     source: "x".into(),
                     display: false,
+                    parenthesized: false,
                 },
             ),
             ("- <b>x</b> y\n", Inline::Html("<b>".into())),
@@ -1973,6 +1980,29 @@ mod tests {
 mod math_regression_tests {
     use super::*;
     use crate::markdown::ast::{Block, Inline};
+
+    #[test]
+    fn paren_math_retains_original_spans_and_tex_in_prose() {
+        let source = r"Before \(x_1+\frac{a*b}{c}\) middle \(y\) after $z$.";
+        let doc = parse_document(source);
+        let got: Vec<_> = doc
+            .inline_math
+            .iter()
+            .map(|(r, s)| (&source[r.clone()], s.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (r"\(x_1+\frac{a*b}{c}\)", r"x_1+\frac{a*b}{c}"),
+                (r"\(y\)", "y"),
+                ("$z$", "z"),
+            ]
+        );
+        assert_eq!(
+            source,
+            "Before \\(x_1+\\frac{a*b}{c}\\) middle \\(y\\) after $z$."
+        );
+    }
 
     /// Dollar amounts in prose must not be swallowed as math: an unclosed
     /// `$` (only one delimiter) stays literal text.

@@ -167,6 +167,7 @@ pub struct App {
     /// Sender for the main loop's channel, so worker threads can push events.  `None` until
     /// `run` creates it.
     app_tx: Option<mpsc::Sender<AppEvent>>,
+    image_decode_slots: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Timestamp of the last scroll change.  `is_scrolling` reads it to fall back to halfblocks
     /// mid-scroll rather than re-encoding Sixel / iTerm2 graphics per frame.  Cleared on resize.
     last_scroll_at: Option<Instant>,
@@ -645,6 +646,7 @@ impl App {
             session_remote_declined: false,
             resize_tx: None,
             app_tx: None,
+            image_decode_slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_scroll_at: None,
             settle_frame_pending: false,
             last_draw_at: None,

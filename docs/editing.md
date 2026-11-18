@@ -381,7 +381,21 @@ Move the cursor into a formula and its `$$...$$` source opens just below the ren
 
 ![LaTeX math formula rendered in edamame](https://raw.githubusercontent.com/mijowi/mijowi.com/refs/heads/main/edamame/media/math.png)
 
-Only whole-paragraph `$$...$$` math is rendered as an image. Inline `$...$` and math mixed with other text in a paragraph stay as their literal source. An HTML export renders display-math paragraphs as images too — the same *Inline figures* toggle that controls diagrams (see [Exporting](#exporting)).
+Inline `$...$` formulas can also be typeset within ordinary paragraphs on the KittyDirect path, including native WezTerm.
+Text flows around each formula's measured cell width; a tall formula increases its text row's height.
+The baseline is an approximation to the terminal font, not a pixel-exact font match.
+Entering the paragraph reveals its complete Markdown source for editing.
+This does not change the file's contents.
+
+Inline typesetting currently excludes headings, lists, quotes, tables, and diff review.
+Those contexts, other image protocols, disabled figures, pending or failed renders, and formulas wider than the document column retain literal math.
+Only the first 128 inline formulas are eligible per document, and paragraphs over 64 KiB remain literal.
+Inline `\(...\)` is also recognized when both delimiters are on the same source line, outside code, HTML and link labels or destinations.
+Escaped backslashes and unmatched delimiters retain ordinary Markdown behavior.
+The two delimiter forms share the same renderer and literal fallback; neither changes the editable source.
+To avoid currency swallowing later prose or code, a dollar followed by a numeric amount, whitespace and a multi-letter prose word (such as `$10 total`) is treated as literal currency outside protected code/link contexts.
+Unambiguous forms such as `$10$`, `$2x$`, `$2 x$`, commands and operators remain math. Use `\(...\)` for prose-like mathematical expressions that would otherwise be ambiguous.
+An HTML export still leaves inline math literal; it renders display-math paragraphs as images through the *Inline figures* toggle (see [Exporting](#exporting)).
 
 When *Figures* is off, a `$$...$$` paragraph isn't rendered to an image — it shows as a `math` code block instead (a `math` header over the formula source), exactly the way a ` ```mermaid ` fence stays a code block. Move the cursor onto the opening or closing `$$` line to edit the delimiters.
 
