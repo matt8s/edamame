@@ -265,6 +265,7 @@ where
     leaf: Option<LeafRec>,
     /// GitHub's footnote numbering, taken from the same events (heading slugs need it).
     footnotes: FootnoteNumbers,
+    inline_math: Vec<(Range<usize>, String)>,
 }
 
 impl<'s, I> EventStream<'s, I>
@@ -282,6 +283,7 @@ where
             base_line: 0,
             leaf: None,
             footnotes: FootnoteNumbers::default(),
+            inline_math: Vec::new(),
         }
     }
 
@@ -296,6 +298,13 @@ where
         let (event, range) = self.inner.next()?;
         self.ranges.observe(self.lines.src, &event, &range);
         self.footnotes.observe(&event);
+        // A global atom budget bounds source retention, decodes and cache size,
+        // even when thousands of formulas share one visible paragraph.
+        if let Event::InlineMath(source) = &event {
+            if self.inline_math.len() < 128 && source.len() <= 64 * 1024 {
+                self.inline_math.push((range.clone(), source.to_string()));
+            }
+        }
         self.pulled_range = range;
         Some(event)
     }
@@ -339,11 +348,23 @@ where
     }
 
     /// Drain the events the parser left unread, so the tracker sees every one, and hand back
-    /// the top-level blocks' byte ranges, every source line's starting byte, and the
-    /// document's footnote numbers.
-    pub(super) fn into_parts(mut self) -> (Vec<Range<usize>>, Vec<usize>, FootnoteNumbers) {
+    /// the top-level block ranges, line starts, footnote numbers, and inline formulas.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn into_parts(
+        mut self,
+    ) -> (
+        Vec<Range<usize>>,
+        Vec<usize>,
+        FootnoteNumbers,
+        Vec<(Range<usize>, String)>,
+    ) {
         while self.next().is_some() {}
-        (self.ranges.into_ranges(), self.lines.starts, self.footnotes)
+        (
+            self.ranges.into_ranges(),
+            self.lines.starts,
+            self.footnotes,
+            self.inline_math,
+        )
     }
 
     /// Range of the event [`next`](Self::next) just returned.  Ask before peeking again: a peek

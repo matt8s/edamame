@@ -26,6 +26,8 @@ pub enum DiagramSource {
     Mermaid(String),
     /// LaTeX display math promoted from a `$$...$$`-only paragraph.
     Latex(String),
+    /// Body-sized math composed atomically with paragraph text.
+    InlineLatex(String),
 }
 
 /// Errors reported by the diagram pipeline.  The renderer / rasterizer /
@@ -71,6 +73,7 @@ pub fn synthetic_url(source: &DiagramSource) -> String {
     let (prefix, src) = match source {
         DiagramSource::Mermaid(src) => (SYNTHETIC_URL_PREFIX, src),
         DiagramSource::Latex(src) => (SYNTHETIC_LATEX_URL_PREFIX, src),
+        DiagramSource::InlineLatex(src) => ("inline-diagram-math-", src),
     };
     let digest = Sha256::digest(src.as_bytes());
     // Lowercase hex by hand: `{digest:x}` is not guaranteed lowercase on
@@ -86,7 +89,9 @@ pub fn synthetic_url(source: &DiagramSource) -> String {
 /// True for a synthetic diagram cache key produced by [`synthetic_url`],
 /// as opposed to a document-authored image URL / path.
 pub fn is_diagram_url(url: &str) -> bool {
-    url.starts_with(SYNTHETIC_URL_PREFIX) || url.starts_with(SYNTHETIC_LATEX_URL_PREFIX)
+    url.starts_with(SYNTHETIC_URL_PREFIX)
+        || url.starts_with(SYNTHETIC_LATEX_URL_PREFIX)
+        || url.starts_with("inline-diagram-math-")
 }
 
 /// Best-effort extraction of a message from a `catch_unwind` payload.

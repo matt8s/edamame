@@ -36,7 +36,7 @@ impl FiguresEnabledPromptModal {
             .image_blocks
             .iter()
             .any(|b| b.source.is_some());
-        if !has_diagram {
+        if !has_diagram && editor.parsed.inline_math.requests.is_empty() {
             return None;
         }
         let body = vec![

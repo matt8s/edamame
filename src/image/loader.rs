@@ -18,6 +18,26 @@ use crate::image::cache::DirectPlacement;
 use crate::image::svg::{rasterize_svg, SvgError, SvgScaleMode, SvgSizing};
 use crate::image::SlicedProtocol;
 
+/// Exact vertical metrics for an inline formula raster, in pixels from the
+/// top of the (already cell-padded) image.
+///
+/// Produced only by the inline math renderer, which derives them from the
+/// RaTeX `DisplayList` before rasterizing — a pure function of the source
+/// and the calibration constants, carrying no untrusted data.  They travel
+/// atomically with the raster: in [`LoadedImage::formula`] across the
+/// decode event and in the cache's `Ready` entry, so a stale async result
+/// can neither attach metrics to a newer raster nor strip them from one.
+/// `None` everywhere else (display math, mermaid, photos) — those paths
+/// never need a TeX baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormulaMetrics {
+    /// The TeX baseline's offset in px from the raster top.  The prose row
+    /// is `baseline_px / cell_height`, and its offset within that row is
+    /// the calibrated body baseline — composition anchors prose there
+    /// instead of guessing the image's vertical middle.
+    pub baseline_px: u32,
+}
+
 /// A decoded image plus the URL `ImageCache` keys it by.
 ///
 /// `scratch` is a pre-rendered halfblocks `Buffer` for a known target rect, built on the worker so
@@ -27,6 +47,9 @@ use crate::image::SlicedProtocol;
 /// `None` without image support, when the dispatcher supplied no picker and target width, or on the
 /// protocol's own cold-path failure.
 ///
+/// `formula` is the inline-math baseline metric that rides with the raster — see
+/// [`FormulaMetrics`]; `None` for every non-inline source.
+///
 /// `Debug` is written by hand below: `SlicedProtocol` is not `Debug`, and the interesting part of
 /// a prebuilt is its geometry, not megabytes of base64.
 pub struct LoadedImage {
@@ -35,6 +58,7 @@ pub struct LoadedImage {
     pub scratch: Option<(Rect, Buffer)>,
     pub sliced: Option<(Rect, SlicedProtocol)>,
     pub direct: Option<(Rect, DirectPlacement)>,
+    pub formula: Option<FormulaMetrics>,
 }
 
 impl std::fmt::Debug for LoadedImage {
@@ -45,6 +69,7 @@ impl std::fmt::Debug for LoadedImage {
             .field("scratch", &self.scratch.as_ref().map(|(rect, _)| *rect))
             .field("sliced", &self.sliced.as_ref().map(|(rect, _)| *rect))
             .field("direct", &self.direct.as_ref().map(|(rect, _)| *rect))
+            .field("formula", &self.formula)
             .finish()
     }
 }
@@ -161,6 +186,9 @@ pub fn resolve(
         scratch: None,
         sliced: None,
         direct: None,
+        // A photo/SVG decode has no TeX baseline; only the inline math
+        // renderer produces one.
+        formula: None,
     })
 }
 

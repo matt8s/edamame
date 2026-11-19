@@ -78,11 +78,15 @@ fn flatten_breakable_chars(inlines: &[Inline], breakable: bool, out: &mut Vec<(c
             // Math content is not breakable — splitting a formula across
             // cell lines would mislead.  Render width = source width
             // (delimiters included), mirroring inlines_to_plain.
-            Inline::Math { source, display } => {
-                let delim = if *display { "$$" } else { "$" };
-                out.extend(delim.chars().map(|c| (c, false)));
+            Inline::Math {
+                source,
+                display,
+                parenthesized,
+            } => {
+                let (open, close) = crate::markdown::ast::math_delimiters(*display, *parenthesized);
+                out.extend(open.chars().map(|c| (c, false)));
                 out.extend(source.chars().map(|c| (c, false)));
-                out.extend(delim.chars().map(|c| (c, false)));
+                out.extend(close.chars().map(|c| (c, false)));
             }
             Inline::SoftBreak => out.push((' ', false)),
             Inline::HardBreak => out.push(('\n', false)),

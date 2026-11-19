@@ -84,6 +84,8 @@ pub(crate) const BASE_OPTIONS: Options = Options::ENABLE_TABLES
 /// Every parse of a document (AST, offset scans, HTML export) goes through here, or the 1:1
 /// blocks↔ranges pairing breaks.
 pub struct DocParser<'a> {
+    source: &'a str,
+    options: Options,
     /// The frontmatter, parsed on its own with its flavor's extension on.
     head: Option<Parser<'a>>,
     /// Everything after the frontmatter, with both extensions off.
@@ -103,11 +105,15 @@ impl<'a> DocParser<'a> {
     pub(crate) fn with_options(source: &'a str, options: Options) -> Self {
         match frontmatter_end(source) {
             Some((end, flavor)) => Self {
+                source,
+                options,
                 head: Some(Parser::new_ext(&source[..end], options | flavor)),
                 body: Parser::new_ext(&source[end..], options),
                 body_start: end,
             },
             None => Self {
+                source,
+                options,
                 head: None,
                 body: Parser::new_ext(source, options),
                 body_start: 0,
@@ -123,16 +129,47 @@ impl<'a> DocParser<'a> {
 
     /// Every event with its byte range in the document.
     pub fn into_offset_iter(self) -> DocOffsetIter<'a> {
+        let source = &self.source[self.body_start..];
+        let options = self.options;
+        let body = self.body.into_offset_iter();
+        let body = if options.contains(Options::ENABLE_MATH) {
+            super::currency_math::adapt(source, body, |shadow| {
+                Parser::new_ext(shadow, options)
+                    .into_offset_iter()
+                    .map(|(e, r)| (e.into_static(), r))
+                    .collect()
+            })
+        } else {
+            super::paren_math::Events::Direct(body)
+        };
+        let body = if options.contains(Options::ENABLE_MATH) {
+            super::paren_math::adapt(source, body, |shadow| {
+                super::currency_math::adapt(
+                    shadow,
+                    Parser::new_ext(shadow, options).into_offset_iter(),
+                    |currency_shadow| {
+                        Parser::new_ext(currency_shadow, options)
+                            .into_offset_iter()
+                            .map(|(e, r)| (e.into_static(), r))
+                            .collect()
+                    },
+                )
+                .map(|(e, r)| (e.into_static(), r))
+                .collect()
+            })
+        } else {
+            super::paren_math::Events::Direct(body)
+        };
         DocOffsetIter {
             head: self.head.map(Parser::into_offset_iter),
-            body: self.body.into_offset_iter(),
+            body,
             shift: self.body_start,
         }
     }
 
-    /// Every event, without ranges.
+    /// Every adapted event, without ranges; identical to [`Self::into_offset_iter`].
     pub(crate) fn into_events(self) -> impl Iterator<Item = Event<'a>> {
-        self.head.into_iter().flatten().chain(self.body)
+        self.into_offset_iter().map(|(event, _)| event)
     }
 }
 
@@ -144,7 +181,7 @@ impl<'a> DocParser<'a> {
 /// the parser's consumers — it showed as several percent of a parse-bound edit on its own.
 pub struct DocOffsetIter<'a> {
     head: Option<OffsetIter<'a>>,
-    body: OffsetIter<'a>,
+    body: super::paren_math::Events<'a, super::paren_math::Events<'a, OffsetIter<'a>>>,
     shift: usize,
 }
 
@@ -367,6 +404,39 @@ fn advance_past_newline(source: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_entrypoints_agree_on_parenthesis_math() {
+        let source = "---\ntitle: \\(metadata\\)\n---\n\nBefore \\(\\text{[a](b) *c*}\\) and $x$.\n\n[link][ref]\n\n[ref]: /target\n";
+        for options in [BASE_OPTIONS, BASE_OPTIONS - Options::ENABLE_MATH] {
+            let expected: Vec<_> = DocParser::with_options(source, options)
+                .into_offset_iter()
+                .map(|(event, _)| event)
+                .collect();
+            let actual: Vec<_> = DocParser::with_options(source, options)
+                .into_events()
+                .collect();
+            assert_eq!(actual, expected, "options={options:?}");
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|event| matches!(event, Event::InlineMath(_)))
+                    .count(),
+                if options.contains(Options::ENABLE_MATH) {
+                    2
+                } else {
+                    0
+                },
+            );
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|event| matches!(event, Event::Start(Tag::MetadataBlock(_))))
+                    .count(),
+                1,
+            );
+        }
+    }
 
     #[test]
     fn single_paragraph() {

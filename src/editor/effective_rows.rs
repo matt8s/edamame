@@ -190,6 +190,16 @@ impl<'a> EffectiveRows<'a> {
         }
     }
 
+    /// Visual position of a normal parsed row after the raw-reveal patch.
+    pub fn rendered_line_visual_row(&self, line: usize) -> usize {
+        let base = self.parsed.visual_rows_before(line, self.width);
+        match &self.patch {
+            Some(p) if line >= p.rendered.end => base - p.base_block_rows + p.raw_rows_total(),
+            Some(p) if line >= p.rendered.start => p.base_before,
+            _ => base,
+        }
+    }
+
     /// Visual row block-relative raw line `raw_line` of the revealed row starts on (absolute,
     /// document coordinates), clamped into the stack.  Panics only if called on the identity
     /// view — callers gate on [`Self::has_reveal`].

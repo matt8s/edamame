@@ -118,6 +118,7 @@ pub fn reconstruct_broken_display_math(
         *inlines = vec![Inline::Math {
             source: inner.to_string(),
             display: true,
+            parenthesized: false,
         }];
         // One formula is one atomic inline, its columns recorded by [`with_formula_cols`] as for
         // a formula pulldown-cmark parsed itself.
@@ -219,6 +220,7 @@ pub fn split_display_math_paragraphs(
                         inlines: vec![Inline::Math {
                             source: formula.to_owned(),
                             display: true,
+                            parenthesized: false,
                         }],
                         src,
                     });
@@ -288,6 +290,7 @@ fn collect_display_math_only(inlines: &[Inline]) -> Option<Vec<&str>> {
             Inline::Math {
                 source,
                 display: true,
+                parenthesized: false,
             } => formulas.push(source),
             Inline::Math { .. } => return None, // lone inline $...$
             Inline::Text(t) if t.trim().is_empty() => {}
@@ -325,6 +328,7 @@ pub(crate) fn math_block_body(inlines: &[Inline]) -> Option<Cow<'_, str>> {
             Inline::Math {
                 source,
                 display: true,
+                parenthesized: false,
             } if formula.is_none() => formula = Some(source),
             Inline::Math { .. } => return None, // a second formula, or inline $…$
             Inline::Text(t) if t.trim().is_empty() => {}

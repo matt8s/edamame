@@ -18,7 +18,7 @@ pub struct PreviewState {
     /// line-render pass so the image overlay can paint into each placeholder's cells.
     pub image_snapshots: Vec<super::ImageLayoutSnapshot>,
     /// `(scroll, area, parsed_version)`; a match reuses `image_snapshots` instead of rebuilding.
-    pub image_snapshots_key: Option<(usize, ratatui::layout::Rect, u64)>,
+    pub image_snapshots_key: Option<crate::ui::image_view::ImageSnapshotKey>,
     /// Link snapshots for preview-mode click hit-testing, populated in `EditorView::render`.
     pub link_snapshots: Vec<super::LinkLayoutSnapshot>,
     /// Same scheme as `image_snapshots_key`.

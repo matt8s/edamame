@@ -62,6 +62,39 @@ pub fn row_for_line(parsed: &ParsedDoc, block: usize, line: usize) -> usize {
 /// `- # H`).  The line's chars show on a later row, so the cursor goes on the first one that places
 /// its column exactly, which is also where a click on that char puts it back.
 pub fn row_for_pos(parsed: &ParsedDoc, block: usize, pos: RawPos) -> usize {
+    let range = parsed.source_map.rendered_lines_for_block(block);
+    let mut endpoint = None;
+    let mut following = None;
+    for abs in range.clone() {
+        if parsed.row_origins()[abs].cols == ColOrigin::Chrome {
+            continue;
+        }
+        if let Some(map) = parsed.inline_math.maps.get(&abs) {
+            if following.is_none() && map[..map.len() - 1].iter().any(|p| *p > pos) {
+                following = Some(abs - range.start);
+            }
+            if map.first().is_some_and(|p| *p <= pos)
+                && map.last().is_some_and(|p| pos <= *p)
+                && map[..map.len() - 1].contains(&pos)
+            {
+                return abs - range.start;
+            }
+            if map.last() == Some(&pos) {
+                endpoint = Some(abs - range.start);
+            }
+        }
+    }
+    for formula in &parsed.inline_math.formulas {
+        if formula.block == block && formula.raw.contains(&pos) {
+            return formula.row + usize::from(formula.ascent) - range.start;
+        }
+    }
+    if let Some(row) = following {
+        return row;
+    }
+    if let Some(row) = endpoint {
+        return row;
+    }
     let row = row_for_line(parsed, block, pos.line);
     let (origins, band) = own_origins(parsed, block);
     let chrome = row
@@ -171,6 +204,10 @@ pub fn stacked_lines(parsed: &ParsedDoc, block: usize, row: usize) -> Option<Ran
 /// `None` in a diagram, whose rows show its lines one for one, and for a shared table row,
 /// which reveals cell by cell.
 pub fn cursor_stack(parsed: &ParsedDoc, block: usize, pos: RawPos) -> Option<(usize, Range<u32>)> {
+    let first = parsed.source_map.rendered_lines_for_block(block).start;
+    if let Some((range, lines)) = parsed.inline_math.paragraphs.get(&first) {
+        return Some((range.start - first, lines.clone()));
+    }
     if parsed.is_diagram_reveal_block(block) {
         return None;
     }
@@ -875,6 +912,10 @@ pub fn rendered_to_raw_col(
     row: usize,
     rendered: usize,
 ) -> RawPos {
+    let abs = parsed.source_map.rendered_lines_for_block(block).start + row;
+    if let Some(map) = parsed.inline_math.maps.get(&abs) {
+        return map[rendered.min(map.len() - 1)];
+    }
     let Some(r) = Row::new(parsed, block, row) else {
         return RawPos {
             line: line_for_row(parsed, block, row),
@@ -929,6 +970,23 @@ pub fn raw_to_rendered_col(
     row: usize,
     pos: RawPos,
 ) -> Option<usize> {
+    let abs = parsed.source_map.rendered_lines_for_block(block).start + row;
+    if let Some(map) = parsed.inline_math.maps.get(&abs) {
+        return map.iter().position(|p| *p == pos).or_else(|| {
+            if let Some(formula) = parsed
+                .inline_math
+                .formulas
+                .iter()
+                .find(|f| f.block == block && f.raw.contains(&pos))
+            {
+                return map.iter().position(|p| *p == formula.raw.start);
+            }
+            map[..map.len() - 1]
+                .iter()
+                .any(|p| *p > pos)
+                .then(|| map[..map.len() - 1].partition_point(|p| *p < pos))
+        });
+    }
     let r = Row::new(parsed, block, row)?;
     let ColOrigin::Content { raw_col, kind, .. } = r.origin.cols else {
         return None;

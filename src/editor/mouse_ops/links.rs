@@ -117,8 +117,9 @@ pub(super) fn follow_footnote_at_click(
 /// The link under rendered `(col, row)`: raw URL and optional title.  The single derivation
 /// behind the hand pointer, the hint-line hover, and click-to-follow.
 ///
-/// Position resolution is scroll- and wrap-aware, and link runs are counted per *block*, not
-/// per line: the block's N-th link-styled run pairs with its N-th `ui::link_view::LinkRun`
+/// Position resolution is scroll- and wrap-aware. Recomposed inline-math rows carry exact
+/// source-link identities, independent of paint runs. Otherwise, link runs are counted per
+/// *block*, not per line: the block's N-th link-styled run pairs with its N-th `ui::link_view::LinkRun`
 /// (the same list `link_view::build_snapshots` pairs against, though by a different run test —
 /// see [`link_run_ranges`]).  A per-line count made every item of a link list resolve to the
 /// first URL.  A run pairing with `LinkRun::ImagePlaceholder` resolves to `None` (painted in
@@ -130,6 +131,12 @@ pub(super) fn link_at_rendered_pos(
     viewport_width: usize,
 ) -> Option<(String, Option<String>)> {
     let (line_idx, char_col) = rendered_click_to_line_col_on_text(state, col, row, viewport_width)?;
+    if let Some(links) = state.parsed.inline_math.links.get(&line_idx) {
+        return links
+            .iter()
+            .find(|link| link.cols.contains(&char_col))
+            .map(|link| (link.url.clone(), link.title.clone()));
+    }
     let theme = state.theme();
     let line = state.parsed.lines.get(line_idx)?;
     let runs = link_run_ranges(line, theme);
@@ -284,4 +291,133 @@ pub fn link_at_offset(source: &str, click_byte: usize) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Buffer;
+    use crate::input::MouseDispatcher;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    fn measured(source: &str, width: usize) -> EditorState {
+        let theme = Box::leak(Box::new(Theme::default()));
+        let mut state = EditorState::new(Buffer::from_str(source), theme);
+        state.inline_math_supported = true;
+        state.set_viewport_width(width);
+        state.refresh_parsed();
+        for info in state.parsed.inline_math.requests.clone() {
+            state
+                .images
+                .set_decoded(&info.url, image::DynamicImage::new_rgba8(20, 20));
+        }
+        state.refresh_parsed();
+        assert!(!state.parsed.inline_math.formulas.is_empty());
+        state
+    }
+
+    fn click_text(state: &mut EditorState, needle: &str, expected: &str, width: usize) {
+        let source = state.buffer.contents();
+        let (idx, chars) = state
+            .parsed
+            .lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, line)| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.find(needle)
+                    .map(|b| (i, text[..b].chars().collect::<Vec<_>>()))
+            })
+            .unwrap_or_else(|| panic!("missing {needle:?}: {:?}", state.parsed.lines));
+        let (sub_row, cell) = crate::document::wrap::char_cells_at(
+            &state.parsed.lines[idx],
+            state.parsed.row_indent(idx),
+            width,
+            chars.len(),
+        )
+        .unwrap();
+        let col = cell.start as u16;
+        let row = (state.parsed.visual_rows_before(idx, width) + sub_row - state.scroll) as u16;
+        let mut dispatcher = MouseDispatcher::new();
+        let action = dispatcher
+            .dispatch(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: col,
+                    row,
+                    modifiers: KeyModifiers::CONTROL,
+                },
+                Rect::new(0, 0, width as u16, 80),
+            )
+            .unwrap();
+        crate::editor::mouse_ops::apply(state, action, &mut None, &[], 80, width);
+        assert_eq!(
+            state.pending_link_follow.take(),
+            Some(LinkTarget::Url(expected.into())),
+            "click {needle}"
+        );
+        assert_eq!(
+            hovered_link_url(state, col, row, width).as_deref(),
+            Some(expected)
+        );
+        let snapshots = crate::ui::link_view::build_snapshots(
+            state,
+            Rect::new(0, 0, width as u16, 80),
+            state.scroll,
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .find_map(|s| s.hit_test(col, row))
+                .map(|s| s.url.as_str()),
+            Some(expected)
+        );
+        assert_eq!(state.buffer.contents(), source);
+    }
+
+    #[test]
+    fn inline_math_unicode_multiline_scrolled_bands_keep_mouse_targets() {
+        let source = "Intro\n\n$x$ [日本 alpha\nbeta gamma delta](https://a.invalid \"A title\")[終](https://b.invalid)";
+        let mut state = measured(source, 12);
+        state.scroll = 2;
+        click_text(&mut state, "beta", "https://a.invalid", 12);
+        click_text(&mut state, "終", "https://b.invalid", 12);
+        assert_eq!(state.buffer.contents(), source);
+    }
+
+    #[test]
+    fn inline_math_keeps_links_on_uncomposed_hard_break_rows() {
+        let mut state = measured(
+            "$x$  \n[one two three four five](https://a.invalid) [B](https://b.invalid)",
+            12,
+        );
+        state.scroll = 1;
+        click_text(&mut state, "three", "https://a.invalid", 12);
+        click_text(&mut state, "B", "https://b.invalid", 12);
+    }
+
+    #[test]
+    fn inline_math_adjacent_links_keep_exact_mouse_targets() {
+        let mut state = measured("$x$ [A](https://a.invalid)[B](https://b.invalid)", 80);
+        click_text(&mut state, "B", "https://b.invalid", 80);
+    }
+
+    #[test]
+    fn inline_math_inside_link_keeps_exact_mouse_target_after_formula() {
+        let mut state = measured(
+            "[Before $x$ after](https://a.invalid) [B](https://b.invalid)",
+            80,
+        );
+        click_text(&mut state, "after", "https://a.invalid", 80);
+    }
+
+    #[test]
+    fn inline_math_wrapped_link_bands_keep_exact_mouse_targets() {
+        let mut state = measured(
+            "$x$ [one two three four five six](https://a.invalid) [B](https://b.invalid)",
+            12,
+        );
+        click_text(&mut state, "three", "https://a.invalid", 12);
+    }
 }
