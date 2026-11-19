@@ -1,6 +1,8 @@
 use crate::document::wrap;
 use crate::document::{row_map, CellBand};
-use crate::editor::row_offset::{locate_block, rendered_sub_line_to_offset, source_text};
+use crate::editor::row_offset::{
+    locate_block, rendered_sub_line_to_offset, reveal_shown, source_text,
+};
 use crate::editor::table_edit_ops;
 use crate::editor::{EditorState, Mode};
 use crate::markdown::table_layout;

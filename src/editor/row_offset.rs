@@ -421,7 +421,7 @@ fn is_revealed_cursor_row(state: &EditorState, block_idx: usize, rendered_line_i
 }
 
 /// Whether the view shows the cursor block revealed: Rendered mode, the reveal on.
-fn reveal_shown(state: &EditorState) -> bool {
+pub(super) fn reveal_shown(state: &EditorState) -> bool {
     state.mode == Mode::Rendered && state.cursor_block_revealed()
 }
 
