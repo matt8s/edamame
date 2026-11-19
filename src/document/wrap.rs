@@ -73,16 +73,11 @@ where
 /// Largest `n` with `chars[start..start + n]` fitting `cell_budget`.  A first char wider
 /// than the budget still returns 1, so the wrap loop makes progress at narrow viewports;
 /// the renderer clips the overflow.
-fn chars_within_cell_budget(
-    chars: &[(char, Style)],
-    widths: Option<&[usize]>,
-    start: usize,
-    cell_budget: usize,
-) -> usize {
+#[inline]
+fn chars_within_cell_budget(widths: impl Iterator<Item = usize>, cell_budget: usize) -> usize {
     let mut total = 0usize;
     let mut count = 0usize;
-    for (i, (ch, _)) in chars.iter().enumerate().skip(start) {
-        let w = widths.map_or_else(|| char_cells(*ch), |w| w[i]);
+    for w in widths {
         if count > 0 && total + w > cell_budget {
             break;
         }
@@ -312,7 +307,7 @@ pub fn visual_rows_of_chars(
     width: usize,
     indent: Indent,
 ) -> Vec<(usize, usize, usize)> {
-    measured_rows(chars, None, width, indent)
+    measured_rows::<false>(chars, &[], width, indent)
 }
 
 /// The same wrap for text characters and atomic inline boxes. `widths` is
@@ -326,12 +321,14 @@ pub fn visual_rows_of_measured_chars(
     indent: Indent,
 ) -> Vec<(usize, usize, usize)> {
     assert_eq!(chars.len(), widths.len());
-    measured_rows(chars, Some(widths), width, indent)
+    measured_rows::<true>(chars, widths, width, indent)
 }
 
-fn measured_rows(
+// Specialize the same break rules for each width source so ordinary text wrapping
+// does not branch per character or read the inline-box width array.
+fn measured_rows<const ATOMIC: bool>(
     chars: &[(char, Style)],
-    widths: Option<&[usize]>,
+    widths: &[usize],
     width: usize,
     indent: Indent,
 ) -> Vec<(usize, usize, usize)> {
@@ -355,14 +352,20 @@ fn measured_rows(
             break;
         }
         let row_width = width.saturating_sub(indent.row(row_idx)).max(1);
-        let n_chars = chars_within_cell_budget(chars, widths, start, row_width);
+        let n_chars = if ATOMIC {
+            chars_within_cell_budget(widths[start..].iter().copied(), row_width)
+        } else {
+            chars_within_cell_budget(
+                chars[start..].iter().map(|(ch, _)| char_cells(*ch)),
+                row_width,
+            )
+        };
         let remaining = chars.len() - start;
         let (row_end, next_start) = if n_chars >= remaining {
             (chars.len(), chars.len())
         } else {
             // Pull the budget back so a hard break falls between clusters, not inside one.
-            let window_end =
-                snap_to_cluster_boundary(joints, start, start + n_chars, widths.is_some());
+            let window_end = snap_to_cluster_boundary(joints, start, start + n_chars, ATOMIC);
             // A row never ends on whitespace alone: a break after a leading pad (a code
             // row's pad cell, an indented raw line) before a word too long to fit would
             // leave a blank row and fit nothing more on the next, so that word hard-breaks
@@ -373,7 +376,12 @@ fn measured_rows(
             // would win and send it down alone.  (An ASCII word ending exactly at the edge
             // still goes down a row: filling the row would absorb the space after it, and a
             // reveal that re-wraps the row could then put a click on that cell-less space.)
-            let edge_space = chars.get(window_end).is_some_and(|c| c.0 == ' ')
+            let space_after = if ATOMIC {
+                chars.get(window_end).is_some_and(|c| c.0 == ' ')
+            } else {
+                chars[window_end].0 == ' '
+            };
+            let edge_space = space_after
                 && chars[start..window_end]
                     .iter()
                     .rev()

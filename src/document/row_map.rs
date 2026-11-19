@@ -958,6 +958,89 @@ pub fn rendered_to_raw_col(
     })
 }
 
+/// All of [`rendered_to_raw_col`] for a whole row at once: entry `c` of the returned vector is
+/// exactly `rendered_to_raw_col(parsed, block, row, c)`, for `c` in `0..=chars`, so a caller that
+/// maps every char (inline-math composition) resolves the row once — prefix anchor, home line
+/// and cell walk — instead of once per char.  A composed row carrying an inline-math map returns
+/// that map directly, clamped at its end.  Positions the per-char form cannot place exactly (a
+/// chrome row, a line the row doesn't show, content no inline map renders exactly) fall back to
+/// the same value the per-char form returns, so the two agree branch-for-branch.
+pub fn rendered_row_positions(
+    parsed: &ParsedDoc,
+    block: usize,
+    row: usize,
+    chars: usize,
+) -> Vec<RawPos> {
+    // The one-pass form of asking [`rendered_to_raw_col`] for every char of the row: entry
+    // `c` of the answer is exactly `rendered_to_raw_col(parsed, block, row, c)`, for callers
+    // that map every char (inline-math composition).  The row resolves once, so the prefix
+    // anchor and home line are computed once instead of per char, the row's cell walk runs
+    // once instead of `chars + 1` times, and no per-char cache lookup or allocation happens.
+    let mut out = vec![RawPos::default(); chars + 1];
+    let abs = parsed.source_map.rendered_lines_for_block(block).start + row;
+    if let Some(map) = parsed.inline_math.maps.get(&abs) {
+        for (c, slot) in out.iter_mut().enumerate() {
+            *slot = map[c.min(map.len().saturating_sub(1))];
+        }
+        return out;
+    }
+    let Some(r) = Row::new(parsed, block, row) else {
+        let line = line_for_row(parsed, block, row);
+        for slot in out.iter_mut() {
+            *slot = RawPos { line, col: 0 };
+        }
+        return out;
+    };
+    let line = r.home_line(row);
+    let caller = |p: RawPos| r.caller_space(p);
+    match r.origin.cols {
+        ColOrigin::Chrome => {
+            let col = r.chrome_col(to_u32(line)).min(r.line_len(line));
+            for slot in out.iter_mut() {
+                *slot = caller(RawPos { line, col });
+            }
+        }
+        ColOrigin::Content { raw_col, kind, .. } => {
+            // The prefix's right-aligned anchor and the line's indent never depend on the
+            // char; a verbatim row takes no prefix branch at all.
+            let (anchor, indent) = if kind != ContentKind::Verbatim {
+                (
+                    r.prefix_anchor(line, raw_col as usize),
+                    r.line_text(line)
+                        .chars()
+                        .take_while(|c| matches!(c, ' ' | '\t'))
+                        .count(),
+                )
+            } else {
+                (0, 0)
+            };
+            let positions = r.positions();
+            let line_len = r.line_len(line);
+            for (c, slot) in out.iter_mut().enumerate() {
+                let k = if c < r.start && kind != ContentKind::Verbatim {
+                    // Right-aligned with the raw prefix, as one char at a time does.
+                    let col = (c + anchor).saturating_sub(r.start).max(indent);
+                    if col < anchor {
+                        *slot = caller(RawPos { line, col });
+                        continue;
+                    }
+                    0
+                } else {
+                    c.saturating_sub(r.start).min(r.content_len())
+                };
+                *slot = match positions {
+                    Some(positions) => caller(positions[k.min(positions.len() - 1)]),
+                    None => caller(RawPos {
+                        line,
+                        col: (raw_col as usize).saturating_add(k).min(line_len),
+                    }),
+                };
+            }
+        }
+    }
+    out
+}
+
 /// The rendered char of row `row` of `block` showing source position `pos`: where its cursor
 /// indicator sits and where an overlay starting or ending there paints.  A position in the
 /// row's raw prefix lands on the rendered prefix right-aligned with it (the inverse of
@@ -1926,5 +2009,156 @@ mod tests {
                 "{src:?} line {line}"
             );
         }
+    }
+
+    /// The one-pass [`rendered_row_positions`] agrees with the per-char
+    /// [`rendered_to_raw_col`] at every char of every row, across the row kinds
+    /// composition meets: prefixes, verbatim, chrome, flow, tables, footnotes,
+    /// wide glyphs, and composed inline-math rows.
+    #[test]
+    fn rendered_row_positions_agrees_with_the_per_char_mapping() {
+        let corpus = concat!(
+            "# Title\n",
+            "\n",
+            "A paragraph with **bold**, *em*, `code`, [a link](https://x.y), and $c = a^2 + b^2$ math inline. ",
+            "It wraps when the viewport is narrow so the positions exercise every branch. ",
+            "Trailing words.\n",
+            "\n",
+            "1. one with a longer item that wraps across the narrow viewport boundary here\n",
+            "2. two\n",
+            "   - nested item with text that also runs on and wraps in the narrow view\n",
+            "\n",
+            "> quote with **strong** words wrapping around the narrow width limit today\n",
+            "\n",
+            "- [ ] task with a body that runs on and on until it wraps in the narrow view\n",
+            "- [x] done\n",
+            "\n",
+            "note with a footnote[^1] and a [ref][r] link\n",
+            "\n",
+            "[^1]: the footnote text wraps in the narrow viewport\n",
+            "\n",
+            "[r]: https://example.org/r\n",
+            "\n",
+            "```rust\n",
+            "fn main() {\n",
+            "    let x = 1 + 2;\n",
+            "    println!(\"{x}\");\n",
+            "}\n",
+            "```\n",
+            "\n",
+            "| a | b |\n",
+            "|---|---|\n",
+            "| long cell content that wraps in the narrow viewport | x |\n",
+            "\n",
+            "CJK 中文 and wide glyphs 日本語 in a paragraph that wraps.\n",
+            "\n",
+            "Inline math with a long body \\( \\frac{\\partial L}{\\partial \\theta} = \\sum_i x_i^2 \\) plus text after it that wraps around the formula atom when the viewport is narrow.\n",
+            "\n",
+            "# Heading with a long title that wraps to a second rendered row here\n",
+        );
+        let font: (u16, u16) = (8, 16);
+        // The inline-math rasters are keyed by font cell + theme colours + TeX source (not by
+        // width), so seed them once from a probe's request list and reuse across every width
+        // combo.  Without real `Ready` entries `measure_inline_math` composes nothing and the
+        // one-pass mapping's inline-math early-return branch is never exercised.
+        let mut images = crate::image::ImageCache::new();
+        let mut probe = ParsedDoc::build_with_overrides(
+            corpus,
+            theme(),
+            true,
+            4,
+            None,
+            None,
+            false,
+            60,
+            false,
+            false,
+            true,
+            false,
+            None,
+        );
+        probe.measure_inline_math(&images, font, 60, theme());
+        let urls: Vec<String> = probe
+            .inline_math
+            .requests
+            .iter()
+            .map(|r| r.url.clone())
+            .collect();
+        assert!(
+            !urls.is_empty(),
+            "corpus should parse at least one inline formula"
+        );
+        for (i, url) in urls.iter().enumerate() {
+            let raster = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                40,
+                24,
+                image::Rgba([255, 255, 255, 255]),
+            ));
+            // First formula is metric-anchored (baseline 16 px = one cell); the rest use the
+            // documented centred fallback — both must compose so the mapping branch is covered.
+            if i == 0 {
+                images.set_decoded_with_prebuilt(
+                    url,
+                    raster,
+                    None,
+                    None,
+                    None,
+                    Some(crate::image::FormulaMetrics { baseline_px: 16 }),
+                );
+            } else {
+                images.set_decoded(url, raster);
+            }
+        }
+        let mut checked = 0usize;
+        let mut composed_maps = 0usize;
+        for (width, reflow) in [(20usize, false), (20, true), (60, false), (60, true)] {
+            let mut d = ParsedDoc::build_with_overrides(
+                corpus,
+                theme(),
+                true,
+                4,
+                None,
+                None,
+                false,
+                width,
+                false,
+                false,
+                true,
+                reflow,
+                None,
+            );
+            d.measure_inline_math(&images, font, width, theme());
+            composed_maps += d.inline_math.maps.len();
+            for block in 0..d.source_map.block_count() {
+                let rows = d.source_map.rendered_lines_for_block(block);
+                for row in 0..rows.len() {
+                    let abs = rows.start + row;
+                    assert!(abs < d.lines.len(), "row out of range");
+                    let chars: usize = d.lines[abs]
+                        .spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum();
+                    let batch = rendered_row_positions(&d, block, row, chars);
+                    assert_eq!(batch.len(), chars + 1);
+                    for (c, &want) in batch.iter().enumerate() {
+                        assert_eq!(
+                            want,
+                            rendered_to_raw_col(&d, block, row, c),
+                            "width {width} reflow {reflow} block {block} row {row} col {c}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            composed_maps > 0,
+            "no composed inline-math map was non-empty across the corpus: the inline-math branch is untested"
+        );
+        assert!(
+            checked > 1000,
+            "corpus exercised too few positions: {checked}"
+        );
     }
 }

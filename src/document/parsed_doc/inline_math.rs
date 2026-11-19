@@ -90,22 +90,7 @@ impl ParsedDoc {
         if events.is_empty() {
             return;
         }
-        // Use the same document event parser as the AST, including reference resolution.
-        // Source ranges remain stable when composition drops separators or splits rows.
-        let source_links: Vec<_> = crate::markdown::parse_offsets::DocParser::new(self.source())
-            .into_offset_iter()
-            .filter_map(|(event, source)| match event {
-                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
-                    dest_url, title, ..
-                }) => Some(InlineLink {
-                    cols: 0..0,
-                    source,
-                    url: dest_url.into_string(),
-                    title: (!title.is_empty()).then(|| title.into_string()),
-                }),
-                _ => None,
-            })
-            .collect();
+
         let mut replacements = HashMap::new();
         let mut requests = Vec::new();
         for block in 0..self.source_map.block_count() {
@@ -147,6 +132,12 @@ impl ParsedDoc {
             }) {
                 continue;
             }
+            // Reuse the exact resolved link events already collected by the parser.
+            let paragraph_links: Vec<_> = self
+                .inline_math_links
+                .iter()
+                .filter(|link| link.source.start < range.end && link.source.end > range.start)
+                .collect();
             // A monotone char → byte index built once, not a source-prefix scan
             // for every painted character. Bound composition of pathological
             // paragraphs independently of the document/renderer's text path.
@@ -187,9 +178,9 @@ impl ParsedDoc {
                     .iter()
                     .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
                     .collect();
-                let positions: Vec<_> = (0..=styled.len())
-                    .map(|c| row_map::rendered_to_raw_col(self, block, abs - rows.start, c))
-                    .collect();
+                // One row resolution per row, not one cache lookup and cell walk per char.
+                let positions: Vec<_> =
+                    row_map::rendered_row_positions(self, block, abs - rows.start, styled.len());
                 let byte_of = |p: RawPos| {
                     raw_bytes
                         .get(
@@ -204,10 +195,15 @@ impl ParsedDoc {
                 };
                 let bytes: Vec<_> = positions.iter().copied().map(byte_of).collect();
                 let link_at = |byte| {
-                    source_links
+                    paragraph_links
                         .iter()
                         .find(|link| link.source.contains(&byte))
-                        .cloned()
+                        .map(|link| InlineLink {
+                            cols: 0..0,
+                            source: link.source.clone(),
+                            url: link.url.clone(),
+                            title: link.title.clone(),
+                        })
                 };
                 let mut atoms = Vec::new();
                 let mut i = 0;
@@ -311,6 +307,10 @@ impl ParsedDoc {
             .map(|b| self.source_map.original_range_for_block(b).unwrap())
             .collect();
         let extended = super::build_extended_ranges(&originals, self.source.len());
+        // Rebuild the row vectors in one linear pass.  `self.row_origins` is read while
+        // still intact (the original, unshifted layout), so a composed block's source-line
+        // range is correct no matter how earlier composed blocks changed the layout height;
+        // unchanged rows are carried over as-is.
         let mut lines = Vec::new();
         let mut origins = Vec::new();
         let mut owners = Vec::new();
@@ -526,4 +526,120 @@ fn compose(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn theme() -> &'static Theme {
+        Box::leak(Box::new(Theme::default()))
+    }
+
+    /// Two top-level paragraphs: the first carries a tall formula that grows its band from one
+    /// row to two.  The second paragraph's source range and reveal must be read from the original,
+    /// unshifted row origins — a stale per-splice offset would report the wrong source line.
+    #[test]
+    fn a_tall_first_formula_does_not_stale_the_later_paragraphs_source_range() {
+        let src = "Tall paragraph first line with $\\frac{a}{b}$ and words.\n\
+                   Second line of the first paragraph, continuing the thought.\n\
+                   \n\
+                   Beta with a short $y = x + 1$ formula and trailing words after it.\n";
+        let font: (u16, u16) = (8, 16);
+        let width = 60usize;
+        let mut d = ParsedDoc::build_with_overrides(
+            src,
+            theme(),
+            true,
+            4,
+            None,
+            None,
+            false,
+            width,
+            false,
+            false,
+            true,
+            false,
+            None,
+        );
+        let mut images = ImageCache::new();
+        // Pass one: empty cache, just to learn the synthetic URLs the measure will key on.
+        d.measure_inline_math(&images, font, width, theme());
+        let urls: Vec<String> = d
+            .inline_math
+            .requests
+            .iter()
+            .map(|r| r.url.clone())
+            .collect();
+        assert_eq!(
+            urls.len(),
+            2,
+            "expected exactly two inline formulas, got {urls:?}"
+        );
+        // First formula tall (two rows), second short (one row).
+        images.set_decoded(
+            &urls[0],
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                40,
+                32,
+                image::Rgba([255, 255, 255, 255]),
+            )),
+        );
+        images.set_decoded(
+            &urls[1],
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                16,
+                16,
+                image::Rgba([255, 255, 255, 255]),
+            )),
+        );
+        // Pass two: real rasters, so composition runs and the row vectors rebuild.
+        d.measure_inline_math(&images, font, width, theme());
+
+        assert_eq!(
+            d.inline_math.formulas.len(),
+            2,
+            "both formulas must be placed"
+        );
+        assert_eq!(
+            d.inline_math.formulas[0].block, 0,
+            "first formula belongs to the first paragraph"
+        );
+        assert_eq!(
+            d.inline_math.formulas[1].block, 2,
+            "second formula belongs to the second paragraph"
+        );
+        let first0 = d.source_map.rendered_lines_for_block(0).start;
+        let first2 = d.source_map.rendered_lines_for_block(2).start;
+        let entry0 = d
+            .inline_math
+            .paragraphs
+            .get(&first0)
+            .expect("first paragraph band must be recorded");
+        let entry2 = d
+            .inline_math
+            .paragraphs
+            .get(&first2)
+            .expect("second paragraph band must be recorded");
+        // The first paragraph spans two source lines and its tall formula grew the band past one
+        // row.
+        assert_eq!(
+            entry0.1,
+            0..2,
+            "first paragraph reveal must span its two source lines"
+        );
+        assert!(
+            entry0.0.len() >= 2,
+            "tall formula band must span >= 2 rows: {:?}",
+            entry0.0
+        );
+        // The second paragraph is a single source line: its reveal must be its own 0..1, not a
+        // stale copy of the first paragraph's 0..2. A per-splice offset read taken after the
+        // first block's band grew would report the first paragraph's range here.
+        assert_eq!(
+            entry2.1,
+            0..1,
+            "second paragraph reveal must be its own single source line, not the first's 0..2"
+        );
+    }
 }

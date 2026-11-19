@@ -65,6 +65,7 @@ pub fn parse_raw_with_ranges(text: &str) -> (Vec<Block>, Vec<Range<usize>>) {
 
 /// What the editor pipeline's single pulldown-cmark pass yields: [`parse_raw_with_ranges`]'s
 /// blocks and ranges, plus the by-products the pass has anyway.
+#[derive(Debug, Clone)]
 pub struct DocParse {
     pub blocks: Vec<Block>,
     pub ranges: Vec<Range<usize>>,
@@ -77,6 +78,15 @@ pub struct DocParse {
     pub footnote_numbers: FootnoteNumbers,
     /// Bounded inline formula sources and exact byte spans from this same pass.
     pub inline_math: Vec<(Range<usize>, String)>,
+    /// Resolved link events with exact source identity for inline composition.
+    pub(crate) inline_links: Vec<SourceLink>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SourceLink {
+    pub source: Range<usize>,
+    pub url: String,
+    pub title: Option<String>,
 }
 
 /// [`parse_raw_with_ranges`] with the rest of [`DocParse`].  `ParsedDoc::build`'s entry point.
@@ -91,8 +101,10 @@ pub fn parse_document(text: &str) -> DocParse {
         .map(|(label, _)| label.to_owned())
         .collect();
     let mut events = EventStream::new(text, parser.into_offset_iter());
+    events.capture_inline_links = memchr::memchr(b'$', text.as_bytes()).is_some()
+        || memchr::memmem::find(text.as_bytes(), b"\\(").is_some();
     let blocks = parse_blocks(&mut events, true);
-    let (ranges, line_starts, footnote_numbers, inline_math) = events.into_parts();
+    let (ranges, line_starts, footnote_numbers, inline_math, inline_links) = events.into_parts();
     DocParse {
         blocks,
         ranges,
@@ -100,6 +112,7 @@ pub fn parse_document(text: &str) -> DocParse {
         link_labels,
         footnote_numbers,
         inline_math,
+        inline_links,
     }
 }
 
@@ -2014,6 +2027,32 @@ mod math_regression_tests {
             "unclosed $ must not parse as math: {:?}",
             blocks
         );
+    }
+
+    #[test]
+    fn inline_composition_links_keep_resolved_reference_ranges() {
+        let src = "[before][ref] \\(x+1\\) [after](/other)\n\n[ref]: /resolved \"title\"\n";
+        let parsed = parse_document(src);
+        assert_eq!(parsed.inline_math.len(), 1);
+        let links: Vec<_> = parsed
+            .inline_links
+            .iter()
+            .map(|link| {
+                (
+                    &src[link.source.clone()],
+                    link.url.as_str(),
+                    link.title.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("[before][ref]", "/resolved", Some("title")),
+                ("[after](/other)", "/other", None),
+            ]
+        );
+        assert!(parse_document("[ordinary](/other)").inline_links.is_empty());
     }
 
     /// Inline `$x$` parses as non-display math inside a mixed paragraph.

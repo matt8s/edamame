@@ -12,7 +12,9 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::Event;
+use pulldown_cmark::{Event, Tag};
+
+use super::SourceLink;
 
 use crate::markdown::ast::{to_u32, LineSpan, SrcLines};
 use crate::markdown::footnote_numbers::FootnoteNumbers;
@@ -266,6 +268,8 @@ where
     /// GitHub's footnote numbering, taken from the same events (heading slugs need it).
     footnotes: FootnoteNumbers,
     inline_math: Vec<(Range<usize>, String)>,
+    pub(super) capture_inline_links: bool,
+    inline_links: Vec<SourceLink>,
 }
 
 impl<'s, I> EventStream<'s, I>
@@ -284,6 +288,8 @@ where
             leaf: None,
             footnotes: FootnoteNumbers::default(),
             inline_math: Vec::new(),
+            capture_inline_links: false,
+            inline_links: Vec::new(),
         }
     }
 
@@ -303,6 +309,18 @@ where
         if let Event::InlineMath(source) = &event {
             if self.inline_math.len() < 128 && source.len() <= 64 * 1024 {
                 self.inline_math.push((range.clone(), source.to_string()));
+            }
+        }
+        if self.capture_inline_links {
+            if let Event::Start(Tag::Link {
+                dest_url, title, ..
+            }) = &event
+            {
+                self.inline_links.push(SourceLink {
+                    source: range.clone(),
+                    url: dest_url.to_string(),
+                    title: (!title.is_empty()).then(|| title.to_string()),
+                });
             }
         }
         self.pulled_range = range;
@@ -357,6 +375,7 @@ where
         Vec<usize>,
         FootnoteNumbers,
         Vec<(Range<usize>, String)>,
+        Vec<SourceLink>,
     ) {
         while self.next().is_some() {}
         (
@@ -364,6 +383,7 @@ where
             self.lines.starts,
             self.footnotes,
             self.inline_math,
+            self.inline_links,
         )
     }
 

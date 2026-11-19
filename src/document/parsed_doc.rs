@@ -17,8 +17,8 @@ use crate::markdown::{
     attach_nested_tui_columns_comments, attach_trailing_tui_columns_comments, heading_slug_text,
     parse_document, promote_diagram_code_blocks, promote_display_math_paragraphs,
     promote_html_comments, promote_image_paragraphs, reconstruct_broken_display_math,
-    split_display_math_paragraphs, Block, ImageRowOverride, RefLabels, RenderCache, Renderer,
-    RowOrigin,
+    split_display_math_paragraphs, Block, DocParse, ImageRowOverride, RefLabels, RenderCache,
+    Renderer, RowOrigin,
 };
 
 mod inline_math;
@@ -45,6 +45,7 @@ pub struct ParsedDoc {
     /// Measured inline formula rows, source maps and image placements.
     pub inline_math: InlineLayout,
     inline_math_sources: Vec<(Range<usize>, String)>,
+    inline_math_links: Vec<crate::markdown::parser::SourceLink>,
     /// Rendered styled lines.
     pub lines: Vec<Line<'static>>,
     /// Where each of [`lines`](Self::lines) came from, 1:1 with it: the source lines it shows,
@@ -132,6 +133,36 @@ pub struct ParsedDoc {
     pub(crate) math_source_offset: Option<(usize, usize)>,
 }
 
+/// A single-slot cache of the width-independent parse, keyed on the exact source content.
+///
+/// [`parse_document`] — and, for a document that contains `\(…\)`, the offset-preserving math
+/// adapter's shadow re-parse — depend only on the source text, never on the viewport width.
+/// Rebuilding it on every width-only refresh is pure waste.  The cache is deliberately
+/// single-slot and self-invalidating: the editor has one live buffer, so a changed source is
+/// simply a content miss and the next parse replaces the entry.  No explicit invalidation on
+/// edit / undo / buffer-swap is needed; the content comparison covers them all.
+#[derive(Debug, Default)]
+pub(crate) struct ParseCache {
+    key: Option<String>,
+    parse: Option<DocParse>,
+}
+
+impl ParseCache {
+    /// The cached parse for `source`, or `None` when the stored source differs (a miss).
+    fn get(&self, source: &str) -> Option<&DocParse> {
+        match (&self.key, &self.parse) {
+            (Some(k), Some(p)) if k == source => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Store `parse` as the entry for `source`, replacing any prior entry.
+    fn put(&mut self, source: &str, parse: DocParse) {
+        self.key = Some(source.to_owned());
+        self.parse = Some(parse);
+    }
+}
+
 impl ParsedDoc {
     /// Parse `source` and render it using `theme`.
     ///
@@ -196,11 +227,63 @@ impl ParsedDoc {
         // `None` (tests, one-shot builds) renders everything from scratch.
         render_cache: Option<&mut RenderCache>,
     ) -> Self {
+        Self::build_with_overrides_impl(
+            source,
+            theme,
+            preserve_blank_lines,
+            image_max_height,
+            live_table_widths,
+            image_row_override,
+            row_striping,
+            viewport_width,
+            big_h1,
+            syntax_highlighting,
+            promote_diagrams,
+            reflow_paragraphs,
+            render_cache,
+            None,
+        )
+    }
+
+    /// Like [`Self::build_with_overrides`], but with a source-keyed parse cache so a
+    /// width-only refresh (source unchanged) reuses the prior parse instead of re-running
+    /// pulldown-cmark — including the `\(…\)`-math shadow re-parse that dominates the cost.
+    /// `parse_cache` is `None` for one-shot and test builds.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_overrides_impl(
+        source: &str,
+        theme: &Theme,
+        preserve_blank_lines: bool,
+        image_max_height: usize,
+        live_table_widths: Option<&(usize, Vec<Option<usize>>)>,
+        image_row_override: Option<ImageRowOverride>,
+        row_striping: bool,
+        viewport_width: usize,
+        big_h1: bool,
+        syntax_highlighting: bool,
+        promote_diagrams: bool,
+        reflow_paragraphs: bool,
+        render_cache: Option<&mut RenderCache>,
+        parse_cache: Option<&mut ParseCache>,
+    ) -> Self {
         // Blocks and their byte ranges from one pulldown-cmark pass, 1:1 until the
         // `tui-columns` merge below.  That merge MUST run before the live-widths override:
         // it checks for `user_widths: None`, so overriding first would leave the comment
         // unabsorbed and flashing into the rendered view between drag events.
-        let parse = parse_document(source);
+        // The parse (and its `\(…\)`-math shadow re-parse) depends only on the source, so a
+        // width-only refresh reuses the cached AST.  On a hit we clone it (the build below
+        // consumes it by move); on a miss we parse and store a copy.
+        let parse = match parse_cache {
+            Some(cache) => match cache.get(source) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let p = parse_document(source);
+                    cache.put(source, p.clone());
+                    p
+                }
+            },
+            None => parse_document(source),
+        };
         let (mut blocks, mut real_ranges) = (parse.blocks, parse.ranges);
         let mut footnote_labels = Vec::new();
         collect_footnote_labels(&blocks, &mut footnote_labels);
@@ -440,6 +523,7 @@ impl ParsedDoc {
         Self {
             inline_math: InlineLayout::default(),
             inline_math_sources: parse.inline_math,
+            inline_math_links: parse.inline_links,
             lines,
             row_origins,
             source: source.into(),
@@ -917,6 +1001,113 @@ mod tests {
         let before = BLOCK_PARSE_COUNT.with(|c| c.get());
         ParsedDoc::build(src, theme(), true, 24);
         assert_eq!(BLOCK_PARSE_COUNT.with(|c| c.get()) - before, 1);
+    }
+
+    /// A same-length edit is a content miss: the key is the full source text, never a length
+    /// or generation number, so an equal-length change reparses and the build reflects it.
+    #[test]
+    fn a_same_length_edit_misses_the_source_keyed_parse_cache() {
+        use crate::markdown::parser::BLOCK_PARSE_COUNT;
+        let mut cache = ParseCache::default();
+        let a = "The ledger shows 42 dollars in the margin.\n";
+        let b = "The ledger shows 43 dollars in the margin.\n";
+        assert_eq!(a.len(), b.len(), "the edit must not change the length");
+        let before = BLOCK_PARSE_COUNT.with(|c| c.get());
+        let doc_a = ParsedDoc::build_with_overrides_impl(
+            a,
+            theme(),
+            true,
+            4,
+            None,
+            None,
+            false,
+            80,
+            false,
+            false,
+            false,
+            true,
+            None,
+            Some(&mut cache),
+        );
+        let after_a = BLOCK_PARSE_COUNT.with(|c| c.get());
+        assert!(after_a > before, "the first build must parse");
+        let doc_b = ParsedDoc::build_with_overrides_impl(
+            b,
+            theme(),
+            true,
+            4,
+            None,
+            None,
+            false,
+            80,
+            false,
+            false,
+            false,
+            true,
+            None,
+            Some(&mut cache),
+        );
+        let after_b = BLOCK_PARSE_COUNT.with(|c| c.get());
+        assert!(after_b > after_a, "a same-length edit must reparse");
+        assert_eq!(doc_a.source(), a);
+        assert_eq!(doc_b.source(), b);
+        let text_b: String = doc_b
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            text_b.contains("43"),
+            "the reparsed build must show the edited text: {text_b:?}"
+        );
+    }
+
+    /// Build controls apply after the cache: flipping `promote_diagrams` on a cache hit must
+    /// still change the output, so the cached parse stays a width/consent-independent input.
+    #[test]
+    fn build_controls_still_apply_on_a_cache_hit() {
+        let src = "Intro line.\n\n$$\nx = 1\n$$\n";
+        let mut cache = ParseCache::default();
+        let figures_off = ParsedDoc::build_with_overrides_impl(
+            src,
+            theme(),
+            true,
+            4,
+            None,
+            None,
+            false,
+            80,
+            false,
+            false,
+            false,
+            true,
+            None,
+            Some(&mut cache),
+        );
+        assert!(
+            figures_off.image_blocks.is_empty(),
+            "figures off: no image blocks"
+        );
+        let figures_on = ParsedDoc::build_with_overrides_impl(
+            src,
+            theme(),
+            true,
+            4,
+            None,
+            None,
+            false,
+            80,
+            false,
+            false,
+            true,
+            true,
+            None,
+            Some(&mut cache),
+        );
+        assert!(
+            !figures_on.image_blocks.is_empty(),
+            "figures on (cache hit) must still promote the display math"
+        );
     }
 
     #[test]

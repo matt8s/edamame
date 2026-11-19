@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Theme;
 use crate::diff::DiffState;
+use crate::document::parsed_doc::ParseCache;
 use crate::document::row_map;
 use crate::document::wrap::Indent;
 use crate::document::{Buffer, Cursor, EditDelta, History, ParsedDoc, Selection, VisualSelection};
@@ -375,6 +376,13 @@ pub struct EditorState {
     /// Keyed by block value plus a render-settings fingerprint, so theme / width / striping
     /// changes clear it automatically.  See `docs/dev/performance.md`.
     render_cache: RenderCache,
+    /// The source-keyed parse cache: a width-only refresh (source unchanged) reuses the prior
+    /// pulldown-cmark parse instead of re-running it — and, for a document with `\(…\)`, skips
+    /// the offset-preserving math adapter's shadow re-parse that otherwise dominates the cost.
+    /// Self-invalidating (a changed source is a content miss), so it needs no explicit clear on
+    /// edit / undo / buffer swap.  It is separate from [`Self::render_cache`], which is cleared
+    /// on every width change; the parse survives those.
+    parse_cache: ParseCache,
     /// A second cache, for the diff's rendered new-side parse only.  It cannot share
     /// [`Self::render_cache`]: eviction is by document membership per build, so the two parses
     /// would evict each other's entries wholesale on every frame of a resize drag.
@@ -492,6 +500,7 @@ impl EditorState {
             substitute_preview: None,
             image_reveal: None,
             render_cache: RenderCache::default(),
+            parse_cache: ParseCache::default(),
             diff_render_cache: RenderCache::default(),
             diff_parse_dirty: false,
         };
@@ -1051,7 +1060,7 @@ impl EditorState {
         // Reflow applies per `want_reflow`.  It rides in `RenderSettings`, so a mode switch that
         // changes it clears the render cache; `sync_reflow_for_mode` triggers the reparse.
         let reflow_paragraphs = self.want_reflow();
-        self.parsed = ParsedDoc::build_with_overrides(
+        self.parsed = ParsedDoc::build_with_overrides_impl(
             &content,
             self.theme,
             self.preserve_blank_lines,
@@ -1065,6 +1074,7 @@ impl EditorState {
             self.diagrams_enabled,
             reflow_paragraphs,
             Some(&mut self.render_cache),
+            Some(&mut self.parse_cache),
         );
         self.parsed_reflow = reflow_paragraphs;
         if self.diagrams_enabled && self.inline_math_supported {
@@ -1410,6 +1420,104 @@ mod tests {
 
     fn theme() -> &'static Theme {
         Box::leak(Box::new(Theme::default()))
+    }
+
+    /// A width-only refresh (byte-identical source) must not reparse: the source-keyed cache
+    /// serves the AST while the new width still applies to the rendered rows.  This is the real
+    /// editor refresh path — `set_viewport_width` re-renders without touching the buffer.
+    #[test]
+    fn a_width_only_refresh_hits_the_source_keyed_parse_cache() {
+        use crate::markdown::parser::BLOCK_PARSE_COUNT;
+        let source = concat!(
+            "A long enough paragraph that reflow wraps it at a narrow width but not a wide one. ",
+            "It carries enough inline emphasis and code so the renderer exercises the normal ",
+            "prose path, and it ends with trailing prose to keep the two widths apart.\n",
+        );
+        let mut state = EditorState::new(Buffer::from_str(source), theme());
+        state.set_reflow(true);
+        let base = BLOCK_PARSE_COUNT.with(|c| c.get());
+        state.set_viewport_width(40);
+        let narrow = state.effective_rows(40).total_visual_rows();
+        let after_first = BLOCK_PARSE_COUNT.with(|c| c.get());
+        assert!(after_first > base, "the first refresh must parse");
+        state.set_viewport_width(96);
+        let wide = state.effective_rows(96).total_visual_rows();
+        let after_resize = BLOCK_PARSE_COUNT.with(|c| c.get());
+        assert_eq!(
+            after_resize, after_first,
+            "a width-only refresh must not reparse the unchanged source"
+        );
+        assert!(
+            narrow > wide,
+            "the new width must still apply to the cached parse: {narrow} vs {wide} rows"
+        );
+    }
+
+    /// A same-length buffer swap is a content miss at the editor level: the cached parse must
+    /// never serve the replaced document's old text.
+    #[test]
+    fn a_same_length_buffer_replacement_reparses_and_renders_the_new_source() {
+        let mut state = EditorState::new(
+            Buffer::from_str("Alpha paragraph with $x$ math.\n"),
+            theme(),
+        );
+        assert!(state.contents().starts_with("Alpha"));
+        state.replace_buffer(Buffer::from_str("Omega paragraph with $x$ math.\n"));
+        assert_eq!(state.contents(), "Omega paragraph with $x$ math.\n");
+        assert!(
+            state.parsed.source().starts_with("Omega"),
+            "the cached parse served the replaced source"
+        );
+        assert!(line_texts(&state).join("\n").contains("Omega"));
+    }
+
+    /// Undo and redo through the editor entry points never serve a stale parse: each step
+    /// changes the source text, so each is a content miss against the full-text key.
+    #[test]
+    fn undo_redo_round_trip_never_serves_a_stale_parse() {
+        use crate::config::Action;
+        use crate::markdown::parser::BLOCK_PARSE_COUNT;
+        let source = "Original paragraph with $x$ math for the round trip.\n";
+        let mut state = EditorState::new(Buffer::from_str(source), theme());
+        state.mode = Mode::Rendered; // Preview's first keypress only enters edit mode
+        let base = BLOCK_PARSE_COUNT.with(|c| c.get());
+        state.place_cursor(source.len() - 2);
+        crate::editor::edit_ops::apply(&mut state, Action::InsertChar('q'), 24, 80);
+        state.flush_parsed_if_dirty();
+        let after_edit = BLOCK_PARSE_COUNT.with(|c| c.get());
+        assert!(after_edit > base, "the edit must reparse");
+        let expected_redo = format!(
+            "{}q{}",
+            &source[..source.len() - 2],
+            &source[source.len() - 2..]
+        );
+        crate::editor::edit_ops::apply(&mut state, Action::Undo, 24, 80);
+        state.flush_parsed_if_dirty();
+        let after_undo = BLOCK_PARSE_COUNT.with(|c| c.get());
+        assert_eq!(
+            state.contents(),
+            source,
+            "undo must restore the original source"
+        );
+        assert!(
+            after_undo > after_edit,
+            "undo restores different content, so it must reparse"
+        );
+        assert!(
+            state.parsed.source().starts_with("Original"),
+            "the cached parse served the edited source"
+        );
+        crate::editor::edit_ops::apply(&mut state, Action::Redo, 24, 80);
+        state.flush_parsed_if_dirty();
+        assert_eq!(
+            state.contents(),
+            expected_redo,
+            "redo must reapply the edit"
+        );
+        assert!(
+            state.parsed.source() == expected_redo,
+            "the cached parse served pre-redo content"
+        );
     }
 
     /// Concatenated text of every non-blank rendered line (skips the phantom trailing row and
